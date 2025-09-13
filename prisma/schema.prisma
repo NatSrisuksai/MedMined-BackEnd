@@ -1,0 +1,39 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
+// Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")  // Prisma จะใช้ตัวนี้ตอน migrate
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+model Patient {
+  id           String         @id @default(uuid())
+  fullName     String
+  lineUserId   String?        @unique
+  createdAt    DateTime       @default(now())
+  prescriptions Prescription[]
+}
+
+model Prescription {
+  id           String   @id @default(uuid())
+  patientId    String
+  patient      Patient  @relation(fields: [patientId], references: [id])
+  opaqueId     String   @unique
+  drugName     String
+  strength     String?
+  instruction  String
+  startDate    DateTime
+  endDate      DateTime?
+  timezone     String   @default("Asia/Bangkok")
+  timesCsv     String   // เช่น "08:00,20:00"
+  notes        String?
+  createdAt    DateTime @default(now())
+}
