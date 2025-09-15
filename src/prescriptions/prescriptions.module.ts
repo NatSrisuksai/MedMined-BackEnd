@@ -1,9 +1,9 @@
 import { Module } from '@nestjs/common';
 import { PrescriptionsController } from './prescriptions.controller';
-import { LineService } from 'src/line/line.service';
+import { LineModule } from 'src/line/line.module';
 
 @Module({
-  imports: [LineService],
+  imports: [LineModule],
   controllers: [PrescriptionsController],
   providers: [],
 })
