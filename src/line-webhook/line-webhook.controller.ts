@@ -1,13 +1,11 @@
 import { Controller, Post, Req, Res } from '@nestjs/common';
 import * as crypto from 'crypto';
-import { LineService } from 'src/line/line.service';
 import { PrismaService } from 'src/prisma/prisma.service';
 
 @Controller('webhook/line')
 export class LineWebhookController {
   constructor(
     private readonly prisma: PrismaService,
-    private readonly line: LineService,
   ) {}
 
   @Post()
