@@ -111,55 +111,77 @@ export class PrescriptionsController {
     if (!lineUserId) throw new BadRequestException('lineUserId is required');
 
     const { rx, patient } = await this.prisma.$transaction(async (tx) => {
-      const rx = await tx.prescription.findUnique({
+      // 1) หาใบยาตาม opaqueId
+      const rx0 = await tx.prescription.findUnique({
         where: { opaqueId },
         include: { patient: true },
       });
-      if (!rx) throw new NotFoundException('Prescription not found');
+      if (!rx0) throw new NotFoundException('Prescription not found');
 
-      // unique constraint: lineUserId on Patient
-      const other = await tx.patient.findFirst({
+      // 2) หา "เจ้าของ LINE นี้" (ถ้ามี)
+      const owner = await tx.patient.findFirst({
         where: { lineUserId },
-        select: { id: true, fullName: true },
+        select: { id: true },
       });
 
-      if (!rx.patient.lineUserId) {
-        if (other && other.id !== rx.patientId) {
-          throw new ConflictException(
-            'This LINE account is used by another patient.',
-          );
+      // CASE A) ใบยานี้ยังไม่ผูก LINE กับเจ้าของ (patient ของใบยาไม่มี lineUserId)
+      if (!rx0.patient.lineUserId) {
+        if (owner && owner.id !== rx0.patientId) {
+          // ✅ adopt: ย้ายใบยาไปอยู่กับ patient เจ้าของ lineUserId
+          await tx.prescription.update({
+            where: { id: rx0.id },
+            data: { patientId: owner.id },
+          });
+          await tx.patient.update({
+            where: { id: owner.id },
+            data: { recentActivatedPrescriptionId: rx0.id },
+          });
+
+          // รีเฟรชข้อมูลหลังย้าย
+          const rx = await tx.prescription.findUnique({
+            where: { id: rx0.id },
+            include: { patient: true },
+          });
+          return { rx: rx!, patient: rx!.patient };
         }
+
+        // ไม่มี owner (ยังไม่เคยผูก LINE ที่ไหน) → ผูกกับ patient ของใบยานี้
         await tx.patient.update({
-          where: { id: rx.patientId },
+          where: { id: rx0.patientId },
           data: {
             lineUserId,
-            recentActivatedPrescriptionId: rx.id, // ✅ จำใบยาล่าสุด
+            recentActivatedPrescriptionId: rx0.id,
           },
         });
-      } else {
-        // เคย bind แล้ว
-        if (rx.patient.lineUserId !== lineUserId) {
-          throw new ConflictException(
-            'This prescription belongs to a different LINE account.',
-          );
-        }
-        // อัปเดต recentActivated ให้เป็นใบนี้ (เวลา user สแกนซ้ำ เราจะจำใบล่าสุดไว้)
-        await tx.patient.update({
-          where: { id: rx.patientId },
-          data: { recentActivatedPrescriptionId: rx.id },
+        const patient = await tx.patient.findUnique({
+          where: { id: rx0.patientId },
         });
+        return { rx: rx0, patient: patient! };
       }
 
-      const patient = await tx.patient.findUnique({
-        where: { id: rx.patientId },
+      // CASE B) ใบยานี้ผูก LINE แล้ว แต่ไม่ตรงกับที่ส่งมา → block
+      if (rx0.patient.lineUserId !== lineUserId) {
+        throw new ConflictException('PRESCRIPTION_BOUND_TO_OTHER_LINE_ACCOUNT');
+      }
+
+      // CASE C) ใบยานี้ผูกกับ LINE นี้อยู่แล้ว → อัปเดต recentActivated และไปต่อ
+      await tx.patient.update({
+        where: { id: rx0.patientId },
+        data: { recentActivatedPrescriptionId: rx0.id },
       });
-      return { rx, patient };
+      const patient = await tx.patient.findUnique({
+        where: { id: rx0.patientId },
+      });
+      return { rx: rx0, patient: patient! };
     });
 
-    // ✅ พุช "ทุกครั้ง" ที่ activate สำเร็จ (สแกนซ้ำก็มา)
+    // 3) พุชทุกครั้งที่ activate สำเร็จ
     const message = buildPrescriptionSummary(rx, patient?.fullName);
-    await this.line.pushText(body.lineUserId, message);
-
+    try {
+      await this.line.pushText(lineUserId, message);
+    } catch (e: any) {
+      throw e;
+    }
     return { ok: true };
   }
 }
@@ -179,15 +201,13 @@ function buildPrescriptionSummary(
     .map((s) => s.trim())
     .filter(Boolean)
     .join(', ');
-
-  const lines: string[] = [];
-  lines.push('ข้อมูลยาของคุณ');
-  if (fullName) lines.push(`• ผู้ป่วย: ${fullName}`);
-  lines.push(
+  const parts = [
+    'ข้อมูลยาของคุณ',
+    fullName ? `• ผู้ป่วย: ${fullName}` : null,
     `• ชื่อยา: ${rx.drugName}${rx.strength ? ` (${rx.strength})` : ''}`,
-  );
-  lines.push(`• วิธีใช้: ${rx.instruction || '-'}`);
-  lines.push(`• เวลา: ${times || '-'}`);
-  if (rx.notes) lines.push(`• หมายเหตุ: ${rx.notes}`);
-  return lines.join('\n');
+    `• วิธีใช้: ${rx.instruction || '-'}`,
+    `• เวลา: ${times || '-'}`,
+    rx.notes ? `• หมายเหตุ: ${rx.notes}` : null,
+  ].filter(Boolean);
+  return parts.join('\n');
 }
