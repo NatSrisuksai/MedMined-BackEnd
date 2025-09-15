@@ -110,77 +110,71 @@ export class PrescriptionsController {
     const lineUserId = (body?.lineUserId || '').trim();
     if (!lineUserId) throw new BadRequestException('lineUserId is required');
 
-    // ทำให้เป็น idempotent + กันชนกันด้วย unique(lineUserId) ที่ Patient
     const { rx, patient } = await this.prisma.$transaction(async (tx) => {
-      // 1) หา prescription จาก opaqueId
       const rx = await tx.prescription.findUnique({
         where: { opaqueId },
         include: { patient: true },
       });
       if (!rx) throw new NotFoundException('Prescription not found');
 
-      // 2) เช็คว่ามีใครใช้ lineUserId นี้อยู่แล้วหรือไม่
-      const exists = await tx.patient.findFirst({
+      // unique constraint: lineUserId on Patient
+      const other = await tx.patient.findFirst({
         where: { lineUserId },
         select: { id: true, fullName: true },
       });
 
-      // 3) กรณี patient ของใบยานี้ยังไม่ถูก bind -> bind ได้ แต่ต้องไม่ชนกับคนอื่น
       if (!rx.patient.lineUserId) {
-        if (exists && exists.id !== rx.patientId) {
-          // มีคนอื่นครอบครอง lineUserId นี้แล้ว
+        if (other && other.id !== rx.patientId) {
           throw new ConflictException(
-            'This LINE account is already bound to another patient.',
+            'This LINE account is used by another patient.',
           );
         }
         await tx.patient.update({
           where: { id: rx.patientId },
-          data: { lineUserId },
+          data: {
+            lineUserId,
+            recentActivatedPrescriptionId: rx.id, // ✅ จำใบยาล่าสุด
+          },
         });
       } else {
-        // 4) กรณีเคย bind แล้ว:
+        // เคย bind แล้ว
         if (rx.patient.lineUserId !== lineUserId) {
-          // ใบยอนี้ผูกกับ LINE อีกคนอยู่
           throw new ConflictException(
-            'This prescription is already bound to a different LINE account.',
+            'This prescription belongs to a different LINE account.',
           );
         }
-        // ถ้าเหมือนเดิม ถือว่า idempotent -> ไม่ต้องอัปเดต
+        // อัปเดต recentActivated ให้เป็นใบนี้ (เวลา user สแกนซ้ำ เราจะจำใบล่าสุดไว้)
+        await tx.patient.update({
+          where: { id: rx.patientId },
+          data: { recentActivatedPrescriptionId: rx.id },
+        });
       }
 
-      // รีเฟรช patient หลังอัปเดต (กันกรณีเพิ่ง bind)
       const patient = await tx.patient.findUnique({
         where: { id: rx.patientId },
       });
-
       return { rx, patient };
     });
 
-    // 5) สร้างสรุปข้อความยา แล้ว push หา lineUserId
-    const message = buildPrescriptionSummary(
-      rx.drugName,
-      rx.strength,
-      rx.instruction,
-      rx.timesCsv,
-      rx.notes,
-      patient?.fullName,
-    );
-
-    await this.line.pushText(lineUserId, message);
+    // ✅ พุช "ทุกครั้ง" ที่ activate สำเร็จ (สแกนซ้ำก็มา)
+    const message = buildPrescriptionSummary(rx, patient?.fullName);
+    await this.line.pushText(body.lineUserId, message);
 
     return { ok: true };
   }
 }
 
 function buildPrescriptionSummary(
-  drugName: string,
-  strength?: string | null,
-  instruction?: string | null,
-  timesCsv?: string | null,
-  notes?: string | null,
+  rx: {
+    drugName: string;
+    strength: string | null;
+    instruction: string | null;
+    timesCsv: string | null;
+    notes: string | null;
+  },
   fullName?: string | null,
 ) {
-  const times = (timesCsv || '')
+  const times = (rx.timesCsv || '')
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean)
@@ -188,12 +182,12 @@ function buildPrescriptionSummary(
 
   const lines: string[] = [];
   lines.push('ข้อมูลยาของคุณ');
-
   if (fullName) lines.push(`• ผู้ป่วย: ${fullName}`);
-  lines.push(`• ชื่อยา: ${drugName}${strength ? ` (${strength})` : ''}`);
-  lines.push(`• วิธีใช้: ${instruction || '-'}`);
+  lines.push(
+    `• ชื่อยา: ${rx.drugName}${rx.strength ? ` (${rx.strength})` : ''}`,
+  );
+  lines.push(`• วิธีใช้: ${rx.instruction || '-'}`);
   lines.push(`• เวลา: ${times || '-'}`);
-  if (notes) lines.push(`• หมายเหตุ: ${notes}`);
-
+  if (rx.notes) lines.push(`• หมายเหตุ: ${rx.notes}`);
   return lines.join('\n');
 }

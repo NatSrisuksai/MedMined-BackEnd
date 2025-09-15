@@ -4,6 +4,7 @@
 // Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
 // Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
 
+
 datasource db {
   provider  = "postgresql"
   url       = env("DATABASE_URL")
@@ -13,27 +14,66 @@ datasource db {
 generator client {
   provider = "prisma-client-js"
 }
-
 model Patient {
-  id           String         @id @default(uuid())
-  fullName     String
-  lineUserId   String?        @unique
-  createdAt    DateTime       @default(now())
+  id            String         @id @default(uuid())
+  fullName      String
+  lineUserId    String?        @unique
+  createdAt     DateTime       @default(now())
   prescriptions Prescription[]
+
+  // ✅ เพิ่ม: จำใบยาที่เพิ่ง activate ล่าสุด (ใช้กับ Rich Menu: "คลังยา")
+  recentActivatedPrescriptionId String?       @unique @map("recent_activated_prescription_id")
+  recentActivatedPrescription   Prescription? @relation("RecentActivated", fields: [recentActivatedPrescriptionId], references: [id])
+
+  // ✅ เพิ่ม: ความสัมพันธ์กับคลังยา
+  inventories MedicationInventory[]
 }
 
 model Prescription {
-  id           String   @id @default(uuid())
-  patientId    String
-  patient      Patient  @relation(fields: [patientId], references: [id])
-  opaqueId     String   @unique
-  drugName     String
-  strength     String?
-  instruction  String
-  startDate    DateTime
-  endDate      DateTime?
-  timezone     String   @default("Asia/Bangkok")
-  timesCsv     String   // เช่น "08:00,20:00"
-  notes        String?
-  createdAt    DateTime @default(now())
+  id        String  @id @default(uuid())
+  patientId String
+  patient   Patient @relation(fields: [patientId], references: [id])
+
+  opaqueId    String    @unique
+  drugName    String
+  strength    String?
+  instruction String
+  startDate   DateTime
+  endDate     DateTime?
+  timezone    String    @default("Asia/Bangkok")
+  timesCsv    String // เช่น "08:00,20:00"
+  notes       String?
+  createdAt   DateTime  @default(now())
+
+  // ✅ ความสัมพันธ์กลับไป recentActivated
+  recentActivatedBy Patient? @relation("RecentActivated")
+
+  MedicationInventory MedicationInventory[]
+}
+
+// ✅ คลังยา: ผู้ใช้ (Patient) เก็บ prescription ใดบ้าง
+model MedicationInventory {
+  id             String   @id @default(uuid())
+  patientId      String
+  prescriptionId String
+  isActive       Boolean  @default(true)
+  createdAt      DateTime @default(now())
+
+  patient      Patient      @relation(fields: [patientId], references: [id])
+  prescription Prescription @relation(fields: [prescriptionId], references: [id])
+
+  @@unique([patientId, prescriptionId])
+  @@index([patientId])
+  @@index([prescriptionId])
+}
+
+// ✅ กันพุชซ้ำภายใน time slot เดียวกัน (ต่อนาที/ต่อใบ/ต่อผู้ป่วย)
+model NotificationLog {
+  id             String   @id @default(uuid())
+  patientId      String
+  prescriptionId String
+  hhmm           String // "08:00"
+  sentAt         DateTime @default(now())
+
+  @@index([patientId, prescriptionId, hhmm, sentAt])
 }
