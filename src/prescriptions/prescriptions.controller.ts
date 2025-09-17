@@ -107,6 +107,14 @@ export class PrescriptionsController {
   }
 
   /** สแกน/เรียก activate → adopt ผูกบัญชี + ตีตรา received + บันทึกเข้าคลัง + พุชสรุปยา */
+  /**
+   * สแกนแล้ว LIFF จะเรียก endpoint นี้
+   * ทำหน้าที่:
+   *  - ผูก lineUserId ↔ Patient
+   *  - ตั้งค่า receivedAt ใน Prescription
+   *  - เพิ่มเข้าคลังยา (MedicationInventory, isActive=true)
+   *  - พุชข้อความสรุปยา
+   */
   @Post('/api/p/:opaqueId/activate')
   async activate(
     @Param('opaqueId') opaqueId: string,
@@ -127,10 +135,10 @@ export class PrescriptionsController {
         select: { id: true },
       });
 
-      // ผูก/ย้ายใบยาให้ตรง owner
+      // กรณีใบยายังไม่ผูก LINE
       if (!rx0.patient.lineUserId) {
         if (owner && owner.id !== rx0.patientId) {
-          // ย้ายใบยาไปหา patient เจ้าของ lineUserId
+          // ย้ายใบยาไปยัง patient ที่ใช้ lineUserId นี้
           await tx.prescription.update({
             where: { id: rx0.id },
             data: { patientId: owner.id, receivedAt: new Date() },
@@ -140,7 +148,7 @@ export class PrescriptionsController {
             data: { recentActivatedPrescriptionId: rx0.id },
           });
         } else {
-          // ผูก LINE กับ patient ของใบยา
+          // ผูก LINE ให้ patient เจ้าของใบยาเดิม
           await tx.patient.update({
             where: { id: rx0.patientId },
             data: { lineUserId, recentActivatedPrescriptionId: rx0.id },
@@ -151,11 +159,13 @@ export class PrescriptionsController {
           });
         }
       } else {
+        // กรณีใบยาผูก LINE แล้ว แต่ไม่ใช่คนเดียวกัน → conflict
         if (rx0.patient.lineUserId !== lineUserId) {
           throw new ConflictException(
             'PRESCRIPTION_BOUND_TO_OTHER_LINE_ACCOUNT',
           );
         }
+        // อัปเดต recentActivated ไว้เพื่อใช้งานอื่น ๆ (ถ้าจำเป็น)
         await tx.patient.update({
           where: { id: rx0.patientId },
           data: { recentActivatedPrescriptionId: rx0.id },
@@ -166,7 +176,7 @@ export class PrescriptionsController {
         });
       }
 
-      // บันทึกเข้าคลังยา (เปิดแจ้งเตือน)
+      // ✅ เพิ่มเข้าคลังยา (เปิดแจ้งเตือนทันที)
       const ownerId = owner?.id ?? rx0.patientId;
       await tx.medicationInventory.upsert({
         where: {
@@ -187,7 +197,7 @@ export class PrescriptionsController {
       return { rx: rx!, patient: rx!.patient };
     });
 
-    // พุชสรุปใบยา
+    // ✅ พุชข้อความสรุปยาไปยังผู้ใช้ทันที
     const message = buildRxSummary(
       {
         drugName: rx.drugName,
@@ -206,16 +216,94 @@ export class PrescriptionsController {
       patient?.fullName || null,
     );
 
-    await this.line.pushText(
-      // ผู้ใช้ปลายทาง
-      patient?.lineUserId || body.lineUserId,
-      message,
-    );
+    await pushText(patient?.lineUserId || lineUserId, message);
 
     return { ok: true };
   }
 }
 
+/* ===== Helpers: สรุปข้อความ & LINE Push ===== */
+
+function buildRxSummary(
+  rx: {
+    drugName: string;
+    quantityTotal: number | null;
+    method: string | null; // BEFORE_MEAL | AFTER_MEAL | WITH_MEAL | NONE
+    timezone: string;
+    startDate: Date;
+    endDate: Date | null;
+    notes: string | null;
+    schedules: { period: string; hhmm: string; pills: number }[];
+  },
+  fullName: string | null,
+) {
+  const periodLabel = (p: string) =>
+    p === 'MORNING'
+      ? 'เช้า'
+      : p === 'NOON'
+        ? 'กลางวัน'
+        : p === 'EVENING'
+          ? 'เย็น'
+          : p === 'BEDTIME'
+            ? 'ก่อนนอน'
+            : 'อื่นๆ';
+
+  const methodTh =
+    rx.method === 'BEFORE_MEAL'
+      ? 'ก่อนอาหาร'
+      : rx.method === 'AFTER_MEAL'
+        ? 'หลังอาหาร'
+        : rx.method === 'WITH_MEAL'
+          ? 'พร้อมอาหาร'
+          : '-';
+
+  const scheduleLines = rx.schedules
+    .filter((s) => !!s.hhmm)
+    .sort((a, b) => a.hhmm.localeCompare(b.hhmm))
+    .map((s) => `• ${periodLabel(s.period)} ${s.hhmm} — ${s.pills} เม็ด`)
+    .join('\n');
+
+  const lines = [
+    '📋 รายละเอียดยา',
+    fullName ? `ผู้ป่วย: ${fullName}` : null,
+    `ชื่อยา: ${rx.drugName}`,
+    typeof rx.quantityTotal === 'number'
+      ? `จำนวนเม็ดยาทั้งหมด: ${rx.quantityTotal}`
+      : null,
+    `วิธีรับประทาน: ${methodTh}`,
+    `ช่วงคอร์ส: ${formatYMD(rx.startDate)}${rx.endDate ? ` ถึง ${formatYMD(rx.endDate)}` : ''}`,
+    `เขตเวลา: ${rx.timezone}`,
+    'ตารางมื้อ:',
+    scheduleLines || '• -',
+    rx.notes ? `หมายเหตุ: ${rx.notes}` : null,
+  ].filter(Boolean);
+
+  return lines.join('\n');
+}
+
+function formatYMD(d: Date) {
+  return new Intl.DateTimeFormat('en-CA', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(d);
+}
+
+async function pushText(to: string, text: string) {
+  const token = process.env.LINE_CHANNEL_ACCESS_TOKEN!;
+  const resp = await fetch('https://api.line.me/v2/bot/message/push', {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({ to, messages: [{ type: 'text', text }] }),
+  });
+  if (!resp.ok) {
+    const body = await resp.text().catch(() => '');
+    throw new Error(`LINE push ${resp.status}: ${body}`);
+  }
+}
 /** map periods (จากฟอร์ม) → DoseSchedule.create[] */
 function mapFormToSchedules(
   periods: Array<{ period: any; hhmm?: string; pills: number }>,
@@ -238,67 +326,4 @@ function mapFormToSchedules(
 function genOpaqueId() {
   // 8 hex ตัวอักษรแบบอ่านง่าย
   return Math.random().toString(16).slice(2, 10);
-}
-
-function buildRxSummary(
-  rx: {
-    drugName: string;
-    quantityTotal: number | null;
-    method: string | null;
-    timezone: string;
-    startDate: Date;
-    endDate: Date | null;
-    notes: string | null;
-    schedules: { period: string; hhmm: string; pills: number }[];
-  },
-  fullName: string | null,
-) {
-  const periodLabel = (p: string) =>
-    p === 'MORNING'
-      ? 'เช้า'
-      : p === 'NOON'
-        ? 'กลางวัน'
-        : p === 'EVENING'
-          ? 'เย็น'
-          : p === 'BEDTIME'
-            ? 'ก่อนนอน'
-            : 'อื่นๆ';
-  const scheduleLines = rx.schedules
-    .filter((s) => !!s.hhmm)
-    .sort((a, b) => a.hhmm.localeCompare(b.hhmm))
-    .map((s) => `• ${periodLabel(s.period)} ${s.hhmm} — ${s.pills} เม็ด`)
-    .join('\n');
-
-  const methodTh =
-    rx.method === 'BEFORE_MEAL'
-      ? 'ก่อนอาหาร'
-      : rx.method === 'AFTER_MEAL'
-        ? 'หลังอาหาร'
-        : rx.method === 'WITH_MEAL'
-          ? 'พร้อมอาหาร'
-          : '-';
-
-  const lines = [
-    '📋 รายละเอียดยา',
-    fullName ? `ผู้ป่วย: ${fullName}` : null,
-    `ชื่อยา: ${rx.drugName}`,
-    typeof rx.quantityTotal === 'number'
-      ? `จำนวนเม็ดยาทั้งหมด: ${rx.quantityTotal}`
-      : null,
-    `วิธีรับประทาน: ${methodTh}`,
-    `เริ่ม: ${formatYMD(rx.startDate)}${rx.endDate ? ` ถึง ${formatYMD(rx.endDate)}` : ''}`,
-    `เขตเวลา: ${rx.timezone}`,
-    'ตารางมื้อ:',
-    scheduleLines || '• -',
-    rx.notes ? `หมายเหตุ: ${rx.notes}` : null,
-  ].filter(Boolean);
-  return lines.join('\n');
-}
-
-function formatYMD(d: Date) {
-  return new Intl.DateTimeFormat('en-CA', {
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-  }).format(d);
 }

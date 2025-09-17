@@ -142,47 +142,6 @@ export class LineWebhookController {
       }
       return;
     }
-
-    // ❷ คลังยา → บันทึกใบล่าสุดเข้าคลัง (เผื่อยังอยากคงปุ่มเดิมไว้)
-    if (text === 'คลังยา') {
-      const patient = await this.prisma.patient.findFirst({
-        where: { lineUserId },
-        select: { id: true, recentActivatedPrescriptionId: true },
-      });
-      if (!patient?.recentActivatedPrescriptionId) {
-        await this.replyTo(
-          ev.replyToken,
-          'ยังไม่มีใบยาล่าสุด โปรดสแกน QR ใบยาก่อน',
-        );
-        return;
-      }
-
-      await this.prisma.medicationInventory.upsert({
-        where: {
-          patientId_prescriptionId: {
-            patientId: patient.id,
-            prescriptionId: patient.recentActivatedPrescriptionId,
-          },
-        },
-        create: {
-          patientId: patient.id,
-          prescriptionId: patient.recentActivatedPrescriptionId,
-          isActive: true,
-        },
-        update: { isActive: true },
-      });
-
-      const rx = await this.prisma.prescription.findUnique({
-        where: { id: patient.recentActivatedPrescriptionId },
-        select: { drugName: true },
-      });
-
-      await this.replyTo(
-        ev.replyToken,
-        `บันทึกเข้าคลังยาแล้ว: ${rx?.drugName}`,
-      );
-      return;
-    }
   }
 
   /** รองรับ postback เผื่อคุณไปสร้าง rich menu ผ่าน Messaging API ภายหลัง */
