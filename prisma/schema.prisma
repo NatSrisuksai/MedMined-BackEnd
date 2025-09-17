@@ -4,29 +4,53 @@
 // Looking for ways to speed up your queries, or scale easily with your serverless or edge functions?
 // Try Prisma Accelerate: https://pris.ly/cli/accelerate-init
 
+// prisma/schema.prisma
+
 datasource db {
   provider  = "postgresql"
   url       = env("DATABASE_URL")
-  directUrl = env("DIRECT_URL") // Prisma จะใช้ตัวนี้ตอน migrate
+  directUrl = env("DIRECT_URL") // ใช้ตอน migrate/deploy
 }
 
 generator client {
   provider = "prisma-client-js"
 }
 
+enum MealRelation {
+  BEFORE_MEAL
+  AFTER_MEAL
+  WITH_MEAL
+  NONE
+}
+
+enum DosePeriod {
+  MORNING
+  NOON
+  EVENING
+  BEDTIME
+  CUSTOM
+}
+
 model Patient {
-  id            String         @id @default(uuid())
-  fullName      String
-  lineUserId    String?        @unique
-  createdAt     DateTime       @default(now())
+  id         String   @id @default(uuid())
+  // ✅ แยกชื่อ-สกุล + ข้อมูลเพิ่ม
+  firstName  String?
+  lastName   String?
+  fullName   String // เก็บรวมเพื่อสะดวกแสดงผล (อัปเดตตาม first/last ในแอป)
+  age        Int?
+  hn         String?  @unique
+  lineUserId String?  @unique
+  createdAt  DateTime @default(now())
+
   prescriptions Prescription[]
+  inventories   MedicationInventory[]
 
-  // ✅ เพิ่ม: จำใบยาที่เพิ่ง activate ล่าสุด (ใช้กับ Rich Menu: "คลังยา")
-  recentActivatedPrescriptionId String?       @unique @map("recent_activated_prescription_id")
-  recentActivatedPrescription   Prescription? @relation("RecentActivated", fields: [recentActivatedPrescriptionId], references: [id])
+  // จำใบยา “ล่าสุด” ที่เพิ่งสแกน/activate (ช่วยให้กดปุ่ม “คลังยา” แบบเดิมได้ด้วยถ้าจะใช้)
+  recentActivatedPrescriptionId String? @unique
 
-  // ✅ เพิ่ม: ความสัมพันธ์กับคลังยา
-  inventories MedicationInventory[]
+  recentActivatedPrescription Prescription? @relation("RecentActivated", fields: [recentActivatedPrescriptionId], references: [id])
+
+  DoseIntake DoseIntake[]
 }
 
 model Prescription {
@@ -34,24 +58,50 @@ model Prescription {
   patientId String
   patient   Patient @relation(fields: [patientId], references: [id])
 
-  opaqueId    String    @unique
-  drugName    String
-  strength    String?
-  instruction String
-  startDate   DateTime
-  endDate     DateTime?
-  timezone    String    @default("Asia/Bangkok")
-  timesCsv    String // เช่น "08:00,20:00"
-  notes       String?
-  createdAt   DateTime  @default(now())
+  opaqueId String @unique
 
-  // ✅ ความสัมพันธ์กลับไป recentActivated
+  // ✅ ฟิลด์เอกสาร/ยาใหม่
+  issueDate     DateTime? // วันที่กรอก/ออกใบจ่ายยา
+  drugName      String
+  quantityTotal Int? // จำนวนเม็ดยาทั้งหมดที่ได้รับ/ต้องทานจนหมด
+  method        MealRelation? // BEFORE/AFTER/WITH/NONE
+  notes         String?
+
+  // ✅ ตารางเวลาแบบ “รายมื้อ/ช่วง” โดยแยกไปที่ DoseSchedule (ด้านล่าง)
+  // ถ้าต้องการเข้ากันได้กับเดิม (ที่เป็น timesCsv HH:mm) ยังเก็บไว้ได้ แต่ cron ใหม่จะอิง DoseSchedule แทน
+  timezone  String    @default("Asia/Bangkok")
+  startDate DateTime
+  endDate   DateTime?
+
+  // ✅ ตีตราว่า “ได้รับยาแล้ว” เมื่อ activate สำเร็จ
+  receivedAt DateTime?
+
+  createdAt DateTime @default(now())
+
+  // ความสัมพันธ์ย้อนกลับ (ไม่ต้องแก้)
   recentActivatedBy Patient? @relation("RecentActivated")
+
+  // ตารางย่อย: ตารางมื้อยา
+  schedules DoseSchedule[]
+  intakes   DoseIntake[]
 
   MedicationInventory MedicationInventory[]
 }
 
-// ✅ คลังยา: ผู้ใช้ (Patient) เก็บ prescription ใดบ้าง
+model DoseSchedule {
+  id             String       @id @default(uuid())
+  prescriptionId String
+  prescription   Prescription @relation(fields: [prescriptionId], references: [id], onDelete: Cascade)
+
+  period    DosePeriod // MORNING/NOON/EVENING/BEDTIME/CUSTOM
+  hhmm      String // "08:00" (หรือค่าจากแบบฟอร์ม เช่น เช้า=08:00, กลางวัน=12:00, เย็น=18:00, ก่อนนอน=22:00)
+  pills     Int // จำนวนเม็ดใน “มื้อ/ช่วง” นี้
+  isActive  Boolean    @default(true)
+  createdAt DateTime   @default(now())
+
+  @@index([prescriptionId])
+}
+
 model MedicationInventory {
   id             String   @id @default(uuid())
   patientId      String
@@ -59,7 +109,8 @@ model MedicationInventory {
   isActive       Boolean  @default(true)
   createdAt      DateTime @default(now())
 
-  patient      Patient      @relation(fields: [patientId], references: [id])
+  patient Patient @relation(fields: [patientId], references: [id])
+
   prescription Prescription @relation(fields: [prescriptionId], references: [id])
 
   @@unique([patientId, prescriptionId])
@@ -67,13 +118,31 @@ model MedicationInventory {
   @@index([prescriptionId])
 }
 
-// ✅ กันพุชซ้ำภายใน time slot เดียวกัน (ต่อนาที/ต่อใบ/ต่อผู้ป่วย)
 model NotificationLog {
   id             String   @id @default(uuid())
   patientId      String
   prescriptionId String
-  hhmm           String // "08:00"
+  hhmm           String // เวลาในมื้อ เช่น "08:00"
+  slotDate       DateTime?
   sentAt         DateTime @default(now())
 
-  @@index([patientId, prescriptionId, hhmm, sentAt])
+  @@index([patientId, prescriptionId, hhmm, slotDate, sentAt])
+}
+
+model DoseIntake {
+  id             String   @id @default(uuid())
+  patientId      String
+  prescriptionId String
+  hhmm           String
+  slotDate       DateTime // วันที่ของมื้อนั้น (00:00)
+  takenAt        DateTime @default(now())
+  pills          Int // จำนวนเม็ดที่ทานจริงในมื้อ/ครั้งนี้ (ปกติ = schedules.pills)
+
+  patient Patient @relation(fields: [patientId], references: [id], onDelete: Cascade)
+
+  prescription Prescription @relation(fields: [prescriptionId], references: [id], onDelete: Cascade)
+
+  // กันกดซ้ำมื้อเดียวกันในวันเดียว
+  @@unique([patientId, prescriptionId, slotDate, hhmm])
+  @@index([patientId, prescriptionId, slotDate, hhmm])
 }
