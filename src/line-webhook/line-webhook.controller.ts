@@ -10,7 +10,7 @@ export class LineWebhookController {
 
   @Post()
   async handle(@Req() req: any, @Res() res: any) {
-    // --- verify signature ---
+    // verify signature
     const signature = req.headers['x-line-signature'] as string;
     const raw: Buffer = req.rawBody;
     if (!raw) return res.status(400).send('Raw body missing');
@@ -23,27 +23,20 @@ export class LineWebhookController {
     if (expected !== signature)
       return res.status(403).send('Invalid signature');
 
-    // --- parse events ---
     const body = JSON.parse(raw.toString('utf8'));
     const events = body.events || [];
 
     for (const ev of events) {
       try {
-        // ✅ รองรับปุ่ม Rich Menu แบบ "ข้อความ" จาก OA Manager (ข้อความ: คลังยา)
         if (ev.type === 'message' && ev.message?.type === 'text') {
           await this.onText(ev);
           continue;
         }
-
-        // (ยังรองรับ postback กรณีคุณสร้างเมนูผ่าน Messaging API ในอนาคต)
         if (ev.type === 'postback' && ev.postback?.data) {
           await this.onPostback(ev);
           continue;
         }
-
-        // เพิ่มเติม: follow/message อื่น ๆ ได้ตามต้องการ
       } catch (err) {
-        // swallow error per event เพื่อไม่ให้ทั้ง batch fail
         this.logger.error('Webhook event error', err as any);
       }
     }
@@ -51,84 +44,112 @@ export class LineWebhookController {
     return res.status(200).send('OK');
   }
 
-  // --------------------------
-  // ❶ onText(): ปุ่ม Rich Menu แบบ "ข้อความ"
-  // OA Manager → Rich menu → ปุ่ม "ข้อความ" → ใส่คำว่า "คลังยา"
-  // ผู้ใช้กดแล้ว OA จะส่ง message event (text="คลังยา") มาที่ webhook
-  // --------------------------
+  /** ปุ่ม Rich Menu แบบ “ข้อความ” */
   private async onText(ev: any) {
     const lineUserId = ev?.source?.userId;
     if (!lineUserId) return;
-
     const text: string = String(ev.message?.text || '').trim();
 
-    // ปรับได้ตามที่ตั้งข้อความบนปุ่ม ถ้าอยากรองรับหลายคำก็เพิ่มใน array
-    const triggers = ['คลังยา'];
-    if (!triggers.includes(text)) return;
-
-    const patient = await this.prisma.patient.findFirst({
-      where: { lineUserId },
-      select: { id: true, recentActivatedPrescriptionId: true },
-    });
-
-    if (!patient?.recentActivatedPrescriptionId) {
-      await this.replyTo(
-        ev.replyToken,
-        'ยังไม่มีใบยาล่าสุด โปรดสแกน QR ใบยาก่อน',
-      );
-      return;
-    }
-
-    const rxId = patient.recentActivatedPrescriptionId;
-
-    // upsert เข้าคลังยา + เปิดแจ้งเตือน
-    await this.prisma.medicationInventory.upsert({
-      where: {
-        patientId_prescriptionId: {
-          patientId: patient.id,
-          prescriptionId: rxId,
+    // ❶ รับประทานยาแล้ว → ตัดแจ้งเตือน "มื้อที่ถึงเวลาแล้วในวันนี้" + บันทึกการทาน
+    if (text === 'รับประทานยาแล้ว') {
+      const patient = await this.prisma.patient.findFirst({
+        where: { lineUserId },
+        select: {
+          id: true,
+          fullName: true,
         },
-      },
-      create: { patientId: patient.id, prescriptionId: rxId, isActive: true },
-      update: { isActive: true },
-    });
+      });
+      if (!patient) {
+        await this.replyTo(
+          ev.replyToken,
+          'ยังไม่พบบัญชีผู้ใช้ โปรดสแกน QR ใบยาก่อน',
+        );
+        return;
+      }
 
-    // ดึงชื่อยาเพื่อแจ้งกลับ
-    const rx = await this.prisma.prescription.findUnique({
-      where: { id: rxId },
-      select: { drugName: true, strength: true },
-    });
+      // ดึง inventories ที่เปิดอยู่ของผู้ใช้
+      const invs = await this.prisma.medicationInventory.findMany({
+        where: { patientId: patient.id, isActive: true },
+        select: {
+          prescription: {
+            select: {
+              id: true,
+              drugName: true,
+              timezone: true,
+              schedules: {
+                where: { isActive: true },
+                select: { period: true, hhmm: true, pills: true },
+              },
+            },
+          },
+        },
+      });
 
-    await this.replyTo(
-      ev.replyToken,
-      `บันทึกเข้าคลังยาแล้ว: ${rx?.drugName}${rx?.strength ? ` (${rx.strength})` : ''}`,
-    );
-  }
+      const takenList: string[] = [];
+      for (const inv of invs) {
+        const rx = inv.prescription;
+        if (!rx) continue;
 
-  // --------------------------
-  // ❷ onPostback(): เผื่อคุณใช้ Rich Menu แบบ postback ผ่าน Messaging API
-  // --------------------------
-  private async onPostback(ev: any) {
-    const data = String(ev.postback.data || '');
-    const lineUserId = ev.source?.userId;
-    if (!lineUserId) return;
+        const rxTz = rx.timezone || 'Asia/Bangkok';
+        const ymd = formatYMDInTz(new Date(), rxTz);
+        const nowMin = hhmmToMinutes(formatHHMMInTz(new Date(), rxTz));
 
-    // หา patient จาก lineUserId
-    const patient = await this.prisma.patient.findFirst({
-      where: { lineUserId },
-      select: { id: true, fullName: true, recentActivatedPrescriptionId: true },
-    });
-    if (!patient) {
-      await this.replyTo(
-        ev.replyToken,
-        'ยังไม่พบบัญชีผู้ใช้ โปรดสแกน QR ใบยาก่อน',
-      );
+        for (const s of rx.schedules) {
+          const schedMin = hhmmToMinutes(s.hhmm);
+          // เฉพาะมื้อที่ "เลยเวลาแล้วในวันนี้"
+          if (nowMin < schedMin) continue;
+
+          const slotDate = ymdToMidnightUTC(ymd);
+          const exists = await this.prisma.doseIntake.findUnique({
+            where: {
+              patientId_prescriptionId_slotDate_hhmm: {
+                patientId: patient.id,
+                prescriptionId: rx.id,
+                slotDate,
+                hhmm: s.hhmm,
+              },
+            },
+            select: { id: true },
+          });
+          if (exists) continue;
+
+          await this.prisma.doseIntake.create({
+            data: {
+              patientId: patient.id,
+              prescriptionId: rx.id,
+              slotDate,
+              hhmm: s.hhmm,
+              pills: s.pills,
+            },
+          });
+
+          takenList.push(
+            `${rx.drugName} — ${periodToThai(s.period)} ${s.hhmm} (${s.pills} เม็ด)`,
+          );
+        }
+      }
+
+      if (takenList.length === 0) {
+        await this.replyTo(
+          ev.replyToken,
+          'ยังไม่พบมื้อที่ถึงเวลาในวันนี้ หรือบันทึกไปแล้ว',
+        );
+      } else {
+        await this.replyTo(
+          ev.replyToken,
+          `บันทึกการรับประทานแล้ว:\n${takenList.map((t, i) => `${i + 1}. ${t}`).join('\n')}`,
+        );
+      }
       return;
     }
 
-    if (data === 'inventory_save_last') {
-      const rxId = patient.recentActivatedPrescriptionId;
-      if (!rxId) {
+    // ❷ คลังยา → บันทึกใบล่าสุดเข้าคลัง (เผื่อยังอยากคงปุ่มเดิมไว้)
+    if (text === 'คลังยา') {
+      const patient = await this.prisma.patient.findFirst({
+        where: { lineUserId },
+        select: { id: true, recentActivatedPrescriptionId: true },
+      });
+      if (!patient?.recentActivatedPrescriptionId) {
         await this.replyTo(
           ev.replyToken,
           'ยังไม่มีใบยาล่าสุด โปรดสแกน QR ใบยาก่อน',
@@ -136,87 +157,42 @@ export class LineWebhookController {
         return;
       }
 
-      // upsert เข้าคลังยา
       await this.prisma.medicationInventory.upsert({
         where: {
           patientId_prescriptionId: {
             patientId: patient.id,
-            prescriptionId: rxId,
+            prescriptionId: patient.recentActivatedPrescriptionId,
           },
         },
-        create: { patientId: patient.id, prescriptionId: rxId, isActive: true },
+        create: {
+          patientId: patient.id,
+          prescriptionId: patient.recentActivatedPrescriptionId,
+          isActive: true,
+        },
         update: { isActive: true },
       });
 
       const rx = await this.prisma.prescription.findUnique({
-        where: { id: rxId },
-        select: { drugName: true, strength: true },
+        where: { id: patient.recentActivatedPrescriptionId },
+        select: { drugName: true },
       });
 
       await this.replyTo(
         ev.replyToken,
-        `บันทึกเข้าคลังยาแล้ว: ${rx?.drugName}${rx?.strength ? ` (${rx.strength})` : ''}`,
+        `บันทึกเข้าคลังยาแล้ว: ${rx?.drugName}`,
       );
-      return;
-    }
-
-    if (data === 'inventory_open') {
-      // (ออปชัน) ส่ง Flex รายการใบยาทั้งหมดของคนๆ นี้ให้กดเลือก
-      await this.replyTo(ev.replyToken, 'กำลังพัฒนาเมนูเลือกหลายใบยา 😉');
-      return;
-    }
-
-    if (data.startsWith('inventory_toggle:')) {
-      const rxId = data.split(':')[1];
-      if (!rxId) return;
-
-      const exist = await this.prisma.medicationInventory.findUnique({
-        where: {
-          patientId_prescriptionId: {
-            patientId: patient.id,
-            prescriptionId: rxId,
-          },
-        },
-      });
-
-      if (exist?.isActive) {
-        await this.prisma.medicationInventory.update({
-          where: {
-            patientId_prescriptionId: {
-              patientId: patient.id,
-              prescriptionId: rxId,
-            },
-          },
-          data: { isActive: false },
-        });
-        await this.replyTo(ev.replyToken, 'ปิดแจ้งเตือนยารายการนี้แล้ว');
-      } else if (exist) {
-        await this.prisma.medicationInventory.update({
-          where: {
-            patientId_prescriptionId: {
-              patientId: patient.id,
-              prescriptionId: rxId,
-            },
-          },
-          data: { isActive: true },
-        });
-        await this.replyTo(ev.replyToken, 'เปิดแจ้งเตือนยารายการนี้แล้ว');
-      } else {
-        await this.prisma.medicationInventory.create({
-          data: { patientId: patient.id, prescriptionId: rxId, isActive: true },
-        });
-        await this.replyTo(
-          ev.replyToken,
-          'บันทึกเข้าคลังยาและเปิดแจ้งเตือนแล้ว',
-        );
-      }
       return;
     }
   }
 
-  // --------------------------
-  // ❸ reply helper
-  // --------------------------
+  /** รองรับ postback เผื่อคุณไปสร้าง rich menu ผ่าน Messaging API ภายหลัง */
+  private async onPostback(ev: any) {
+    const data = String(ev.postback.data || '');
+    if (data === 'inventory_open') {
+      await this.replyTo(ev.replyToken, 'กำลังพัฒนาเมนูเลือกหลายใบยา 😉');
+    }
+  }
+
   private async replyTo(replyToken: string, text: string) {
     await fetch('https://api.line.me/v2/bot/message/reply', {
       method: 'POST',
@@ -230,4 +206,42 @@ export class LineWebhookController {
       }),
     });
   }
+}
+
+/* ===== Helpers (เวลา/โซน/ข้อความ) ===== */
+function formatYMDInTz(date: Date, timeZone: string) {
+  const fmt = new Intl.DateTimeFormat('en-CA', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  });
+  return fmt.format(date);
+}
+function formatHHMMInTz(date: Date, timeZone: string) {
+  const fmt = new Intl.DateTimeFormat('en-GB', {
+    timeZone,
+    hour12: false,
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+  return fmt.format(date);
+}
+function hhmmToMinutes(hhmm: string) {
+  const [h, m] = hhmm.split(':').map(Number);
+  return (h || 0) * 60 + (m || 0);
+}
+function ymdToMidnightUTC(ymd: string) {
+  return new Date(`${ymd}T00:00:00.000Z`);
+}
+function periodToThai(p: string) {
+  return p === 'MORNING'
+    ? 'เช้า'
+    : p === 'NOON'
+      ? 'กลางวัน'
+      : p === 'EVENING'
+        ? 'เย็น'
+        : p === 'BEDTIME'
+          ? 'ก่อนนอน'
+          : 'อื่นๆ';
 }
