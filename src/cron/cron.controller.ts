@@ -250,6 +250,7 @@ function periodToThai(p: string) {
 }
 async function pushText(to: string, text: string) {
   const token = process.env.LINE_CHANNEL_ACCESS_TOKEN!;
+  console.log('test')
   const res = await fetch('https://api.line.me/v2/bot/message/push', {
     method: 'POST',
     headers: {
