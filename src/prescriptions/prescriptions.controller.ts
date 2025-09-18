@@ -3,10 +3,12 @@ import {
   Body,
   ConflictException,
   Controller,
+  Get,
   NotFoundException,
   Param,
   Post,
   Logger,
+  Query,
 } from '@nestjs/common';
 import { LineService } from 'src/line/line.service';
 import { PrismaService } from 'src/prisma/prisma.service';
@@ -44,6 +46,173 @@ export class PrescriptionsController {
     private readonly line: LineService,
   ) {}
 
+
+  @Get('/api/prescriptions')
+  async getAll(
+    @Query('hn') hn?: string,
+    @Query('date') date?: string,
+    @Query('patientName') patientName?: string,
+    @Query('limit') limit?: string,
+    @Query('skip') skip?: string,
+  ) {
+    try {
+      const where: any = {};
+
+      if (hn) {
+        where.patient = {
+          hn: {
+            contains: hn,
+            mode: 'insensitive'
+          }
+        };
+      }
+
+      if (patientName) {
+        where.patient = {
+          ...where.patient,
+          OR: [
+            { firstName: { contains: patientName, mode: 'insensitive' } },
+            { lastName: { contains: patientName, mode: 'insensitive' } },
+            { fullName: { contains: patientName, mode: 'insensitive' } }
+          ]
+        };
+      }
+
+      if (date) {
+        const targetDate = new Date(date);
+        const nextDay = new Date(targetDate);
+        nextDay.setDate(nextDay.getDate() + 1);
+        
+        where.issueDate = {
+          gte: targetDate,
+          lt: nextDay
+        };
+      }
+
+      const prescriptions = await this.prisma.prescription.findMany({
+        where,
+        include: {
+          patient: {
+            select: {
+              id: true,
+              firstName: true,
+              lastName: true,
+              fullName: true,
+              hn: true,
+              age: true,
+              lineUserId: true,
+            }
+          },
+          schedules: {
+            orderBy: { hhmm: 'asc' }
+          },
+          intakes: {
+            select: {
+              id: true,
+              slotDate: true,
+              hhmm: true,
+              takenAt: true,
+              pills: true
+            }
+          }
+        },
+        orderBy: { createdAt: 'desc' },
+        take: limit ? parseInt(limit) : 100,
+        skip: skip ? parseInt(skip) : 0,
+      });
+
+      const formattedPrescriptions = prescriptions.map(rx => {
+
+        let status = 'รอรับยา';
+        if (rx.receivedAt) {
+          status = 'รับยาแล้ว';
+        }
+        if (rx.patient?.lineUserId) {
+          status = 'เชื่อม LINE แล้ว';
+        }
+        
+        const morning = rx.schedules.find(s => s.period === 'MORNING')?.pills || 0;
+        const noon = rx.schedules.find(s => s.period === 'NOON')?.pills || 0;
+        const evening = rx.schedules.find(s => s.period === 'EVENING')?.pills || 0;
+        const night = rx.schedules.find(s => s.period === 'BEDTIME')?.pills || 0;
+        
+        const beforeMeal = rx.method === 'BEFORE_MEAL' || rx.method === 'WITH_MEAL';
+        const afterMeal = rx.method === 'AFTER_MEAL' || rx.method === 'WITH_MEAL';
+
+        return {
+          id: rx.id,
+          opaqueId: rx.opaqueId,
+          status,
+          hn: rx.patient?.hn || '',
+          firstName: rx.patient?.firstName || '',
+          lastName: rx.patient?.lastName || '',
+          fullName: rx.patient?.fullName || '',
+          age: rx.patient?.age,
+          date: rx.issueDate ? this.formatDateThai(rx.issueDate) : '',
+          issueDate: rx.issueDate?.toISOString().split('T')[0] || '',
+          medicineName: rx.drugName,
+          strength: '', // ไม่มีใน database ปัจจุบัน
+          totalAmount: rx.quantityTotal || 0,
+          beforeMeal,
+          afterMeal,
+          morning,
+          noon,
+          evening,
+          night,
+          instruction: this.buildInstruction(beforeMeal, afterMeal, morning, noon, evening, night),
+          notes: rx.notes || '',
+          startDate: rx.startDate?.toISOString().split('T')[0] || '',
+          endDate: rx.endDate?.toISOString().split('T')[0] || '',
+          receivedAt: rx.receivedAt?.toISOString() || null,
+          intakeCount: rx.intakes.length,
+          schedules: rx.schedules,
+        };
+      });
+
+      return formattedPrescriptions;
+      
+    } catch (error) {
+      this.logger.error('Error fetching prescriptions:', error);
+      throw new BadRequestException('Failed to fetch prescriptions');
+    }
+  }
+
+  @Get('/api/p/:opaqueId')
+  async getByOpaqueId(@Param('opaqueId') opaqueId: string) {
+    const prescription = await this.prisma.prescription.findUnique({
+      where: { opaqueId },
+      include: {
+        patient: true,
+        schedules: {
+          orderBy: { hhmm: 'asc' }
+        }
+      }
+    });
+
+    if (!prescription) {
+      throw new NotFoundException('Prescription not found');
+    }
+
+    const morning = prescription.schedules.find(s => s.period === 'MORNING')?.pills || 0;
+    const noon = prescription.schedules.find(s => s.period === 'NOON')?.pills || 0;
+    const evening = prescription.schedules.find(s => s.period === 'EVENING')?.pills || 0;
+    const night = prescription.schedules.find(s => s.period === 'BEDTIME')?.pills || 0;
+
+    return {
+      ...prescription,
+      patient: {
+        fullName: prescription.patient.fullName,
+        hn: prescription.patient.hn,
+        age: prescription.patient.age
+      },
+      morning,
+      noon,
+      evening,
+      night,
+      totalAmount: prescription.quantityTotal
+    };
+  }
+
   /** สร้างใบยาใหม่ + ผูกกับผู้ป่วย (อ้างอิงจาก HN ถ้ามี ไม่งั้นสร้างใหม่) */
   @Post('/api/prescriptions')
   async create(@Body() dto: CreatePrescriptionDTO) {
@@ -62,9 +231,8 @@ export class PrescriptionsController {
     const fullName = `${dto.patientFirstName} ${dto.patientLastName}`.trim();
     const timezone = dto.timezone || 'Asia/Bangkok';
     const opaqueId = genOpaqueId();
-
     const patient = await this.prisma.patient.upsert({
-      where: dto.hn ? { hn: dto.hn } : { hn: '___NO_SUCH_HN___' }, // ถ้าไม่มี HN จะไม่ match → ไป create
+      where: dto.hn ? { hn: dto.hn } : { hn: '___NO_SUCH_HN___' },
       update: {
         firstName: dto.patientFirstName,
         lastName: dto.patientLastName,
@@ -78,7 +246,7 @@ export class PrescriptionsController {
         age: typeof dto.age === 'number' ? dto.age : null,
         hn: dto.hn || null,
       },
-      select: { id: true, fullName: true },
+      select: { id: true, fullName: true, hn: true },
     });
 
     const created = await this.prisma.prescription.create({
@@ -89,9 +257,9 @@ export class PrescriptionsController {
         drugName: dto.drugName,
         quantityTotal: dto.quantityTotal ?? null,
         method: dto.method ?? null,
-        timezone,
+        timezone: timezone,
         startDate: new Date(dto.startDate),
-        endDate: dto.endDate ? new Date(dto.endDate) : null,
+        endDate: null,
         notes: dto.notes ?? null,
         schedules: { create: mapFormToSchedules(dto.periods) },
       },
@@ -103,18 +271,16 @@ export class PrescriptionsController {
       opaqueId,
       prescriptionId: created.id,
       patientId: patient.id,
+      patient: {
+        fullName: patient.fullName,
+        hn: patient.hn,
+        age: typeof dto.age === 'number' ? dto.age : null,
+      },
+      prescription: created,
     };
   }
 
   /** สแกน/เรียก activate → adopt ผูกบัญชี + ตีตรา received + บันทึกเข้าคลัง + พุชสรุปยา */
-  /**
-   * สแกนแล้ว LIFF จะเรียก endpoint นี้
-   * ทำหน้าที่:
-   *  - ผูก lineUserId ↔ Patient
-   *  - ตั้งค่า receivedAt ใน Prescription
-   *  - เพิ่มเข้าคลังยา (MedicationInventory, isActive=true)
-   *  - พุชข้อความสรุปยา
-   */
   @Post('/api/p/:opaqueId/activate')
   async activate(
     @Param('opaqueId') opaqueId: string,
@@ -165,7 +331,6 @@ export class PrescriptionsController {
             'PRESCRIPTION_BOUND_TO_OTHER_LINE_ACCOUNT',
           );
         }
-        // อัปเดต recentActivated ไว้เพื่อใช้งานอื่น ๆ (ถ้าจำเป็น)
         await tx.patient.update({
           where: { id: rx0.patientId },
           data: { recentActivatedPrescriptionId: rx0.id },
@@ -176,7 +341,6 @@ export class PrescriptionsController {
         });
       }
 
-      // ✅ เพิ่มเข้าคลังยา (เปิดแจ้งเตือนทันที)
       const ownerId = owner?.id ?? rx0.patientId;
       await tx.medicationInventory.upsert({
         where: {
@@ -197,7 +361,6 @@ export class PrescriptionsController {
       return { rx: rx!, patient: rx!.patient };
     });
 
-    // ✅ พุชข้อความสรุปยาไปยังผู้ใช้ทันที
     const message = buildRxSummary(
       {
         drugName: rx.drugName,
@@ -220,6 +383,35 @@ export class PrescriptionsController {
 
     return { ok: true };
   }
+
+  private formatDateThai(date: Date): string {
+    const day = date.getDate();
+    const month = date.getMonth() + 1;
+    const year = date.getFullYear() + 543 - 2500; // Buddhist year (2 digits)
+    return `${day}/${month}/${year.toString().slice(-2)}`;
+  }
+
+  private buildInstruction(
+    beforeMeal: boolean,
+    afterMeal: boolean,
+    morning: number,
+    noon: number,
+    evening: number,
+    night: number
+  ): string {
+    let instruction = '';
+    const times: string[] = [];
+    
+    if (beforeMeal) instruction = 'รับประทานก่อนอาหาร ';
+    else if (afterMeal) instruction = 'รับประทานหลังอาหาร ';
+    
+    if (morning > 0) times.push(`เช้า ${morning} เม็ด`);
+    if (noon > 0) times.push(`กลางวัน ${noon} เม็ด`);
+    if (evening > 0) times.push(`เย็น ${evening} เม็ด`);
+    if (night > 0) times.push(`ก่อนนอน ${night} เม็ด`);
+    
+    return instruction + times.join(' ');
+  }
 }
 
 /* ===== Helpers: สรุปข้อความ & LINE Push ===== */
@@ -228,7 +420,7 @@ function buildRxSummary(
   rx: {
     drugName: string;
     quantityTotal: number | null;
-    method: string | null; // BEFORE_MEAL | AFTER_MEAL | WITH_MEAL | NONE
+    method: string | null;
     timezone: string;
     startDate: Date;
     endDate: Date | null;
