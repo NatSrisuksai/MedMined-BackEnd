@@ -2,6 +2,18 @@ import { Controller, Post, Req, Res, Logger } from '@nestjs/common';
 import * as crypto from 'crypto';
 import { PrismaService } from 'src/prisma/prisma.service';
 
+const PERIOD_WINDOWS: Record<string, { start: number; end: number }> = {
+  MORNING: { start: hm('08:00'), end: hm('12:00') },
+  NOON: { start: hm('12:00'), end: hm('18:00') },
+  EVENING: { start: hm('18:00'), end: hm('22:00') },
+  BEDTIME: { start: hm('22:00'), end: hm('24:00') },
+  CUSTOM: { start: 0, end: 0 },
+};
+function hm(hhmm: string) {
+  const [h, m] = hhmm.split(':').map(Number);
+  return (h || 0) * 60 + (m || 0);
+}
+
 @Controller('webhook/line')
 export class LineWebhookController {
   private readonly logger = new Logger(LineWebhookController.name);
@@ -30,7 +42,6 @@ export class LineWebhookController {
       try {
         if (ev.type === 'message' && ev.message?.type === 'text') {
           await this.onText(ev);
-          continue;
         }
       } catch (err) {
         this.logger.error('Webhook event error', err as any);
@@ -40,13 +51,11 @@ export class LineWebhookController {
     return res.status(200).send('OK');
   }
 
-  /** รับเฉพาะข้อความจากผู้ใช้ */
   private async onText(ev: any) {
     const lineUserId = ev?.source?.userId;
     if (!lineUserId) return;
     const text: string = String(ev.message?.text || '').trim();
 
-    // ✅ รับประทานยาแล้ว → บันทึกเฉพาะ "ช่วงเวลาปัจจุบัน" ของแต่ละใบยา
     if (text === 'รับประทานยาแล้ว') {
       const patient = await this.prisma.patient.findFirst({
         where: { lineUserId },
@@ -60,7 +69,6 @@ export class LineWebhookController {
         return;
       }
 
-      // คลังยาที่เปิดอยู่
       const invs = await this.prisma.medicationInventory.findMany({
         where: { patientId: patient.id, isActive: true },
         select: {
@@ -69,10 +77,10 @@ export class LineWebhookController {
               id: true,
               drugName: true,
               timezone: true,
+              quantityTotal: true, // ✅ ต้องใช้เพื่อเช็กครบคอร์ส
               schedules: {
                 where: { isActive: true },
                 select: { period: true, hhmm: true, pills: true },
-                orderBy: { hhmm: 'asc' },
               },
             },
           },
@@ -80,6 +88,7 @@ export class LineWebhookController {
       });
 
       const takenList: string[] = [];
+      const completionLines: string[] = []; // ✅ เก็บบรรทัดแจ้งจบคอร์ส (อาจมีหลายใบ)
 
       for (const inv of invs) {
         const rx = inv.prescription;
@@ -89,27 +98,12 @@ export class LineWebhookController {
         const ymd = formatYMDInTz(new Date(), tz);
         const nowMin = hhmmToMinutes(formatHHMMInTz(new Date(), tz));
 
-        const sorted = rx.schedules
-          .slice()
-          .sort((a, b) => a.hhmm.localeCompare(b.hhmm));
-
-        // หาช่วงเวลาปัจจุบันเพียง 1 ช่วง: start <= now < nextStart
-        let current = null as null | {
-          hhmm: string;
-          pills: number;
-          period: string;
-        };
-        for (let i = 0; i < sorted.length; i++) {
-          const s = sorted[i];
-          const startMin = hhmmToMinutes(s.hhmm);
-          const endMin =
-            i + 1 < sorted.length ? hhmmToMinutes(sorted[i + 1].hhmm) : 24 * 60;
-          if (nowMin >= startMin && nowMin < endMin) {
-            current = { hhmm: s.hhmm, pills: s.pills, period: s.period };
-            break;
-          }
-        }
-        if (!current) continue; // ตอนนี้ไม่ได้อยู่ในช่วงไหน → ข้ามใบยานี้
+        // หาช่วง "ปัจจุบัน" ตาม fixed windows
+        const current = rx.schedules.find((s) => {
+          const win = PERIOD_WINDOWS[s.period];
+          return win && nowMin >= win.start && nowMin < win.end;
+        });
+        if (!current) continue;
 
         const slotDate = ymdToMidnightUTC(ymd);
 
@@ -141,6 +135,37 @@ export class LineWebhookController {
         takenList.push(
           `${rx.drugName} — ${periodToThai(current.period)} ${current.hhmm} (${current.pills} เม็ด)`,
         );
+
+        // ✅ เช็กครบคอร์ส "ทันที" หลังบันทึก แล้วปิดคลัง + เติมบรรทัดแจ้งเตือน
+        if (typeof rx.quantityTotal === 'number') {
+          const sumTaken = await this.prisma.doseIntake.aggregate({
+            where: { prescriptionId: rx.id },
+            _sum: { pills: true },
+          });
+          const consumed = sumTaken._sum.pills || 0;
+          if (consumed >= rx.quantityTotal) {
+            // ปิดคลังยา (กัน cron ดึงมาอีก)
+            try {
+              await this.prisma.medicationInventory.update({
+                where: {
+                  patientId_prescriptionId: {
+                    patientId: patient.id,
+                    prescriptionId: rx.id,
+                  },
+                },
+                data: { isActive: false },
+              });
+            } catch (e: any) {
+              this.logger.warn(
+                `inventory deactivate failed p=${patient.id} rx=${rx.id}: ${e?.message || e}`,
+              );
+            }
+            // เติมบรรทัดแจ้งจบคอร์สใน "ข้อความตอบกลับเดียวกัน"
+            completionLines.push(
+              `🎉 คอร์สยา "${rx.drugName}" ครบแล้ว ระบบหยุดแจ้งเตือนให้แล้วค่ะ/ครับ`,
+            );
+          }
+        }
       }
 
       if (takenList.length === 0) {
@@ -149,10 +174,11 @@ export class LineWebhookController {
           'ยังไม่พบช่วงเวลาปัจจุบัน หรือบันทึกไปแล้ว',
         );
       } else {
-        await this.replyTo(
-          ev.replyToken,
-          `บันทึกการรับประทานแล้ว:\n${takenList.map((t, i) => `${i + 1}. ${t}`).join('\n')}`,
-        );
+        const msg =
+          `บันทึกการรับประทานแล้ว:\n` +
+          takenList.map((t, i) => `${i + 1}. ${t}`).join('\n') +
+          (completionLines.length ? `\n\n${completionLines.join('\n')}` : '');
+        await this.replyTo(ev.replyToken, msg);
       }
       return;
     }
