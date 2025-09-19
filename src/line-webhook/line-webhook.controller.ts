@@ -32,10 +32,6 @@ export class LineWebhookController {
           await this.onText(ev);
           continue;
         }
-        if (ev.type === 'postback' && ev.postback?.data) {
-          await this.onPostback(ev);
-          continue;
-        }
       } catch (err) {
         this.logger.error('Webhook event error', err as any);
       }
@@ -44,20 +40,17 @@ export class LineWebhookController {
     return res.status(200).send('OK');
   }
 
-  /** ปุ่ม Rich Menu แบบ “ข้อความ” */
+  /** รับเฉพาะข้อความจากผู้ใช้ */
   private async onText(ev: any) {
     const lineUserId = ev?.source?.userId;
     if (!lineUserId) return;
     const text: string = String(ev.message?.text || '').trim();
 
-    // ❶ รับประทานยาแล้ว → ตัดแจ้งเตือน "มื้อที่ถึงเวลาแล้วในวันนี้" + บันทึกการทาน
+    // ✅ รับประทานยาแล้ว → บันทึกเฉพาะ "ช่วงเวลาปัจจุบัน" ของแต่ละใบยา
     if (text === 'รับประทานยาแล้ว') {
       const patient = await this.prisma.patient.findFirst({
         where: { lineUserId },
-        select: {
-          id: true,
-          fullName: true,
-        },
+        select: { id: true, fullName: true },
       });
       if (!patient) {
         await this.replyTo(
@@ -67,7 +60,7 @@ export class LineWebhookController {
         return;
       }
 
-      // ดึง inventories ที่เปิดอยู่ของผู้ใช้
+      // คลังยาที่เปิดอยู่
       const invs = await this.prisma.medicationInventory.findMany({
         where: { patientId: patient.id, isActive: true },
         select: {
@@ -79,6 +72,7 @@ export class LineWebhookController {
               schedules: {
                 where: { isActive: true },
                 select: { period: true, hhmm: true, pills: true },
+                orderBy: { hhmm: 'asc' },
               },
             },
           },
@@ -86,53 +80,73 @@ export class LineWebhookController {
       });
 
       const takenList: string[] = [];
+
       for (const inv of invs) {
         const rx = inv.prescription;
-        if (!rx) continue;
+        if (!rx || rx.schedules.length === 0) continue;
 
-        const rxTz = rx.timezone || 'Asia/Bangkok';
-        const ymd = formatYMDInTz(new Date(), rxTz);
-        const nowMin = hhmmToMinutes(formatHHMMInTz(new Date(), rxTz));
+        const tz = rx.timezone || 'Asia/Bangkok';
+        const ymd = formatYMDInTz(new Date(), tz);
+        const nowMin = hhmmToMinutes(formatHHMMInTz(new Date(), tz));
 
-        for (const s of rx.schedules) {
-          const schedMin = hhmmToMinutes(s.hhmm);
-          // เฉพาะมื้อที่ "เลยเวลาแล้วในวันนี้"
-          if (nowMin < schedMin) continue;
+        const sorted = rx.schedules
+          .slice()
+          .sort((a, b) => a.hhmm.localeCompare(b.hhmm));
 
-          const slotDate = ymdToMidnightUTC(ymd);
-          const exists = await this.prisma.doseIntake.findUnique({
-            where: {
-              patientId_prescriptionId_slotDate_hhmm: {
-                patientId: patient.id,
-                prescriptionId: rx.id,
-                slotDate,
-                hhmm: s.hhmm,
-              },
-            },
-            select: { id: true },
-          });
-          if (exists) continue;
+        // หาช่วงเวลาปัจจุบันเพียง 1 ช่วง: start <= now < nextStart
+        let current = null as null | {
+          hhmm: string;
+          pills: number;
+          period: string;
+        };
+        for (let i = 0; i < sorted.length; i++) {
+          const s = sorted[i];
+          const startMin = hhmmToMinutes(s.hhmm);
+          const endMin =
+            i + 1 < sorted.length ? hhmmToMinutes(sorted[i + 1].hhmm) : 24 * 60;
+          if (nowMin >= startMin && nowMin < endMin) {
+            current = { hhmm: s.hhmm, pills: s.pills, period: s.period };
+            break;
+          }
+        }
+        if (!current) continue; // ตอนนี้ไม่ได้อยู่ในช่วงไหน → ข้ามใบยานี้
 
-          await this.prisma.doseIntake.create({
-            data: {
+        const slotDate = ymdToMidnightUTC(ymd);
+
+        // กันบันทึกซ้ำ
+        const exists = await this.prisma.doseIntake.findUnique({
+          where: {
+            patientId_prescriptionId_slotDate_hhmm: {
               patientId: patient.id,
               prescriptionId: rx.id,
               slotDate,
-              hhmm: s.hhmm,
-              pills: s.pills,
+              hhmm: current.hhmm,
             },
-          });
+          },
+          select: { id: true },
+        });
+        if (exists) continue;
 
-          takenList.push(
-            `${rx.drugName} — ${periodToThai(s.period)} ${s.hhmm} (${s.pills} เม็ด)`,
-          );
-        }
+        // บันทึกการทานเฉพาะช่วงนี้
+        await this.prisma.doseIntake.create({
+          data: {
+            patientId: patient.id,
+            prescriptionId: rx.id,
+            slotDate,
+            hhmm: current.hhmm,
+            pills: current.pills,
+          },
+        });
+
+        takenList.push(
+          `${rx.drugName} — ${periodToThai(current.period)} ${current.hhmm} (${current.pills} เม็ด)`,
+        );
       }
 
       if (takenList.length === 0) {
         await this.replyTo(
           ev.replyToken,
-          'ยังไม่พบมื้อที่ถึงเวลาในวันนี้ หรือบันทึกไปแล้ว',
+          'ยังไม่พบช่วงเวลาปัจจุบัน หรือบันทึกไปแล้ว',
         );
       } else {
         await this.replyTo(
@@ -141,14 +155,6 @@ export class LineWebhookController {
         );
       }
       return;
-    }
-  }
-
-  /** รองรับ postback เผื่อคุณไปสร้าง rich menu ผ่าน Messaging API ภายหลัง */
-  private async onPostback(ev: any) {
-    const data = String(ev.postback.data || '');
-    if (data === 'inventory_open') {
-      await this.replyTo(ev.replyToken, 'กำลังพัฒนาเมนูเลือกหลายใบยา 😉');
     }
   }
 

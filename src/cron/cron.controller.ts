@@ -47,7 +47,7 @@ export class CronController {
   }
 
   private async processTick() {
-    // 1) ผู้ใช้ที่เป็นเพื่อน OA (มี lineUserId)
+    // 1) เลือกผู้ใช้ที่เป็นเพื่อน OA
     const patients = await this.prisma.patient.findMany({
       where: { lineUserId: { not: null } },
       select: {
@@ -62,9 +62,8 @@ export class CronController {
     let users = 0,
       items = 0;
 
-    // 2) เดินทีละคน
     for (const p of patients) {
-      // คลังยาที่เปิดแจ้งเตือน
+      // 2) ดึงคลังยาที่เปิดแจ้งเตือน
       const invs = await this.prisma.medicationInventory.findMany({
         where: { patientId: p.id, isActive: true },
         select: {
@@ -75,10 +74,13 @@ export class CronController {
               timezone: true,
               startDate: true,
               endDate: true,
+              issueDate: true,
+              createdAt: true,
               quantityTotal: true,
               schedules: {
                 where: { isActive: true },
                 select: { period: true, hhmm: true, pills: true },
+                orderBy: { hhmm: 'asc' },
               },
             },
           },
@@ -97,17 +99,18 @@ export class CronController {
 
       for (const inv of invs) {
         const rx = inv.prescription;
-        if (!rx) continue;
+        if (!rx || rx.schedules.length === 0) continue;
 
-        const rxTz = rx.timezone || 'Asia/Bangkok';
-        const { ymd, minutes } = nowInTz(rxTz);
+        const tz = rx.timezone || 'Asia/Bangkok';
+        const { ymd, minutes: nowMin } = nowInTz(tz);
 
-        // อยู่ในช่วงวันของคอร์ส
-        const startOk = formatYMDInTz(rx.startDate, rxTz) <= ymd;
-        const endOk = !rx.endDate || ymd <= formatYMDInTz(rx.endDate, rxTz);
+        // อยู่ในคอร์ส (fallback: start = startDate ?? issueDate ?? createdAt)
+        const effStart = rx.startDate ?? rx.issueDate ?? rx.createdAt;
+        const startOk = formatYMDInTz(effStart, tz) <= ymd;
+        const endOk = !rx.endDate || ymd <= formatYMDInTz(rx.endDate, tz);
         if (!startOk || !endOk) continue;
 
-        // (ออปชัน) ถ้าทานครบจำนวนทั้งหมดแล้ว ให้ข้าม
+        // ข้ามถ้ากินครบแล้ว
         if (typeof rx.quantityTotal === 'number') {
           const sumTaken = await this.prisma.doseIntake.aggregate({
             where: { prescriptionId: rx.id },
@@ -116,13 +119,21 @@ export class CronController {
           if ((sumTaken._sum.pills || 0) >= rx.quantityTotal) continue;
         }
 
-        for (const s of rx.schedules) {
-          const schedMin = hhmmToMinutes(s.hhmm);
-          if (minutes < schedMin) continue; // ยังไม่ถึงเวลา
+        // === คำนวณ "ช่วงเวลาปัจจุบัน" (window) ===
+        const sorted = rx.schedules
+          .slice()
+          .sort((a, b) => a.hhmm.localeCompare(b.hhmm));
+        // หากเวลาปัจจุบันอยู่ภายใน [slot_i, next_slot) ของช่องใด slot นั้นคือ "ช่วงปัจจุบัน"
+        for (let i = 0; i < sorted.length; i++) {
+          const s = sorted[i];
+          const startMin = hhmmToMinutes(s.hhmm);
+          const endMin =
+            i + 1 < sorted.length ? hhmmToMinutes(sorted[i + 1].hhmm) : 24 * 60;
+          if (!(nowMin >= startMin && nowMin < endMin)) continue; // ไม่ใช่ช่วงนี้
 
           const slotDate = ymdToMidnightUTC(ymd);
 
-          // ถ้ากินแล้วใน slot นี้วันนี้ → ไม่เตือน
+          // กินแล้วในช่วงนี้ของวันนี้หรือยัง
           const taken = await this.prisma.doseIntake.findUnique({
             where: {
               patientId_prescriptionId_slotDate_hhmm: {
@@ -134,9 +145,9 @@ export class CronController {
             },
             select: { id: true },
           });
-          if (taken) continue;
+          if (taken) break; // ช่วงนี้กินแล้ว → ไม่ต้องเตือนใบยานี้
 
-          // เตือนซ้ำทุก 30 นาที
+          // เตือนซ้ำทุก 30 นาทีในช่วงนี้
           const lastNotif = await this.prisma.notificationLog.findFirst({
             where: {
               patientId: p.id,
@@ -151,18 +162,19 @@ export class CronController {
             !lastNotif ||
             Date.now() - new Date(lastNotif.sentAt).getTime() >=
               REMIND_EVERY_MIN * 60_000;
-          if (!shouldRemind) continue;
+          if (!shouldRemind) break;
 
           const label = `${periodToThai(s.period)} ${s.hhmm} — ${rx.drugName} ${s.pills} เม็ด`;
           dueSlots.push({
             rxId: rx.id,
             rxName: rx.drugName,
-            tz: rxTz,
+            tz,
             label,
             slotHhmm: s.hhmm,
             pills: s.pills,
             slotDateISO: slotDate.toISOString(),
           });
+          break; // เจอช่วงปัจจุบันแล้ว เลิก loop ของใบยานี้
         }
       }
 
@@ -172,7 +184,7 @@ export class CronController {
         p.fullName || [p.firstName, p.lastName].filter(Boolean).join(' ');
       const msg = `⏰ ถึงเวลาใช้ยาแล้ว
 ${name ? `ผู้ป่วย: ${name}\n` : ''}${dueSlots.map((d, i) => `${i + 1}. ${d.label}`).join('\n')}
-(ตอบ "รับประทานยาแล้ว" เพื่อหยุดเตือนมื้อนี้)`;
+(พิมพ์ "รับประทานยาแล้ว" เพื่อหยุดเตือนช่วงนี้)`;
 
       try {
         await pushText(p.lineUserId!, msg);
