@@ -123,13 +123,10 @@ export class PrescriptionsController {
 
       const formattedPrescriptions = prescriptions.map(rx => {
 
-        let status = 'รอรับยา';
-        if (rx.receivedAt) {
-          status = 'รับยาแล้ว';
-        }
-        if (rx.patient?.lineUserId) {
-          status = 'เชื่อม LINE แล้ว';
-        }
+      let status = 'รอรับยา';
+      if (rx.patient?.lineUserId) {
+        status = 'รับยาแล้ว';
+      }
         
         const morning = rx.schedules.find(s => s.period === 'MORNING')?.pills || 0;
         const noon = rx.schedules.find(s => s.period === 'NOON')?.pills || 0;
