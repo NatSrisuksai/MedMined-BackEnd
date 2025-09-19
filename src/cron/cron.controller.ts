@@ -147,7 +147,22 @@ export class CronController {
             where: { prescriptionId: rx.id },
             _sum: { pills: true },
           });
-          if ((sumTaken._sum.pills || 0) >= rx.quantityTotal) continue;
+          if ((sumTaken._sum.pills || 0) >= rx.quantityTotal) {
+            await this.prisma.medicationInventory.update({
+              where: {
+                patientId_prescriptionId: {
+                  patientId: p.id,
+                  prescriptionId: rx.id,
+                },
+              },
+              data: { isActive: false },
+            });
+            await pushText(
+              p.lineUserId!,
+              `🎉 คอร์สยา "${rx.drugName}" ครบแล้ว ระบบหยุดแจ้งเตือนให้แล้วครับ`,
+            );
+            continue;
+          }
         }
 
         if (DYNAMIC) {
