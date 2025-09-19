@@ -9,7 +9,7 @@ const MAX_RUN_MS = 55_000;
 const REMIND_EVERY_MIN = Number(1);
 
 // เปิดโหมด Dynamic (ใช้เวลาจาก schedules จริง ๆ) หรือ Fixed (ช่วงคงที่)
-const DYNAMIC = process.env.CRON_DYNAMIC_WINDOW === '1';
+const DYNAMIC = true;
 
 // เปิด/ปิด verbose log
 const VERBOSE = (process.env.CRON_VERBOSE || '1') !== '0';
