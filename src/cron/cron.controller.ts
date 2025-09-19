@@ -141,27 +141,41 @@ export class CronController {
         const endOk = !rx.endDate || ymd <= formatYMDInTz(rx.endDate, tz);
         if (!startOk || !endOk) continue;
 
-        // ข้ามถ้ากินครบแล้ว
+        // ✅ ถ้ากินครบแล้ว: ปิดคลัง + แจ้งเตือน “จบคอร์ส” แล้วค่อยข้ามใบยานี้
         if (typeof rx.quantityTotal === 'number') {
           const sumTaken = await this.prisma.doseIntake.aggregate({
             where: { prescriptionId: rx.id },
             _sum: { pills: true },
           });
-          if ((sumTaken._sum.pills || 0) >= rx.quantityTotal) {
-            await this.prisma.medicationInventory.update({
-              where: {
-                patientId_prescriptionId: {
-                  patientId: p.id,
-                  prescriptionId: rx.id,
+          const consumed = sumTaken._sum.pills || 0;
+          if (consumed >= rx.quantityTotal) {
+            try {
+              await this.prisma.medicationInventory.update({
+                where: {
+                  patientId_prescriptionId: {
+                    patientId: p.id,
+                    prescriptionId: rx.id,
+                  },
                 },
-              },
-              data: { isActive: false },
-            });
-            await pushText(
-              p.lineUserId!,
-              `🎉 คอร์สยา "${rx.drugName}" ครบแล้ว ระบบหยุดแจ้งเตือนให้แล้วครับ`,
-            );
-            continue;
+                data: { isActive: false },
+              });
+            } catch (e: any) {
+              // เผื่อถูกปิดไปแล้วในรอบก่อน
+              this.logger?.warn?.(
+                `inventory deactivate failed p=${p.id} rx=${rx.id}: ${e?.message || e}`,
+              );
+            }
+            try {
+              await pushText(
+                p.lineUserId!,
+                `🎉 คอร์สยา "${rx.drugName}" ครบแล้ว ระบบหยุดแจ้งเตือนให้แล้วค่ะ/ครับ`,
+              );
+            } catch (e: any) {
+              this.logger?.error?.(
+                `push course-done error to ${p.lineUserId}: ${e?.message || e}`,
+              );
+            }
+            continue; // ข้ามไปใบยาถัดไป
           }
         }
 
