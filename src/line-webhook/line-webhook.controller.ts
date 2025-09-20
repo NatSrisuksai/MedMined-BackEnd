@@ -56,6 +56,87 @@ export class LineWebhookController {
     if (!lineUserId) return;
     const text: string = String(ev.message?.text || '').trim();
 
+    if (text === 'ข้อมูลผู้ใช้') {
+      const patient = await this.prisma.patient.findFirst({
+        where: { lineUserId },
+        select: { id: true, fullName: true, age: true, hn: true },
+      });
+      if (!patient) {
+        await this.replyTo(
+          ev.replyToken,
+          'ยังไม่พบบัญชีผู้ใช้ โปรดสแกน QR ใบยาก่อน',
+        );
+        return;
+      }
+
+      // ดึงยาที่อยู่ใน "คลังยา" (เปิดใช้งานอยู่)
+      const invs = await this.prisma.medicationInventory.findMany({
+        where: { patientId: patient.id, isActive: true },
+        select: {
+          prescription: {
+            select: {
+              id: true,
+              drugName: true,
+              quantityTotal: true,
+              schedules: {
+                where: { isActive: true },
+                select: { period: true, hhmm: true, pills: true },
+                orderBy: { hhmm: 'asc' },
+              },
+            },
+          },
+        },
+        orderBy: { prescriptionId: 'asc' },
+      });
+
+      // สรุปรายการยา
+      const lines: string[] = [];
+      let idx = 1;
+
+      for (const inv of invs) {
+        const rx = inv.prescription;
+        if (!rx) continue;
+
+        const schedulesText = rx.schedules.length
+          ? rx.schedules
+              .map(
+                (s) => `${periodToThai(s.period)} ${s.hhmm} (${s.pills} เม็ด)`,
+              )
+              .join(', ')
+          : '-';
+
+        // รวมยอดที่กินไปแล้ว เพื่อนับ "ยังเหลือ"
+        let remainingText = '-';
+        if (typeof rx.quantityTotal === 'number') {
+          const sum = await this.prisma.doseIntake.aggregate({
+            where: { prescriptionId: rx.id },
+            _sum: { pills: true },
+          });
+          const taken = sum._sum.pills || 0;
+          const remaining = Math.max(0, rx.quantityTotal - taken);
+          remainingText = `${remaining}`;
+        }
+
+        lines.push(
+          `${idx}. ${rx.drugName} จำนวน ${rx.quantityTotal ?? '-'}\n` +
+            `ช่วงเวลาที่ต้องกิน: ${schedulesText}\n` +
+            `ยังเหลือยาที่ต้องกิน: ${remainingText}`,
+        );
+        idx++;
+      }
+
+      const header =
+        `ชื่อผู้ป่วย: ${patient.fullName || '-'}  อายุ: ${patient.age ?? '-'}\n` +
+        `HN: ${patient.hn ?? '-'}`;
+      const body = lines.length
+        ? `รายชื่อยาทั้งหมด:\n${lines.join('\n')}`
+        : 'ยังไม่มีใบยาที่เปิดแจ้งเตือน';
+
+      await this.replyTo(ev.replyToken, `${header}\n${body}`);
+      return;
+    }
+
+    // ✅ เดิม: "รับประทานยาแล้ว" → บันทึกเฉพาะช่วงปัจจุบัน + ถ้าครบคอร์สให้แจ้งทันที
     if (text === 'รับประทานยาแล้ว') {
       const patient = await this.prisma.patient.findFirst({
         where: { lineUserId },
@@ -77,7 +158,7 @@ export class LineWebhookController {
               id: true,
               drugName: true,
               timezone: true,
-              quantityTotal: true, // ✅ ต้องใช้เพื่อเช็กครบคอร์ส
+              quantityTotal: true, // ใช้เช็กครบคอร์ส
               schedules: {
                 where: { isActive: true },
                 select: { period: true, hhmm: true, pills: true },
@@ -88,7 +169,7 @@ export class LineWebhookController {
       });
 
       const takenList: string[] = [];
-      const completionLines: string[] = []; // ✅ เก็บบรรทัดแจ้งจบคอร์ส (อาจมีหลายใบ)
+      const completionLines: string[] = [];
 
       for (const inv of invs) {
         const rx = inv.prescription;
@@ -121,7 +202,7 @@ export class LineWebhookController {
         });
         if (exists) continue;
 
-        // บันทึกการทานเฉพาะช่วงนี้
+        // บันทึกการทานช่วงนี้
         await this.prisma.doseIntake.create({
           data: {
             patientId: patient.id,
@@ -136,7 +217,7 @@ export class LineWebhookController {
           `${rx.drugName} — ${periodToThai(current.period)} ${current.hhmm} (${current.pills} เม็ด)`,
         );
 
-        // ✅ เช็กครบคอร์ส "ทันที" หลังบันทึก แล้วปิดคลัง + เติมบรรทัดแจ้งเตือน
+        // เช็กครบคอร์สทันที
         if (typeof rx.quantityTotal === 'number') {
           const sumTaken = await this.prisma.doseIntake.aggregate({
             where: { prescriptionId: rx.id },
@@ -144,7 +225,6 @@ export class LineWebhookController {
           });
           const consumed = sumTaken._sum.pills || 0;
           if (consumed >= rx.quantityTotal) {
-            // ปิดคลังยา (กัน cron ดึงมาอีก)
             try {
               await this.prisma.medicationInventory.update({
                 where: {
@@ -160,7 +240,6 @@ export class LineWebhookController {
                 `inventory deactivate failed p=${patient.id} rx=${rx.id}: ${e?.message || e}`,
               );
             }
-            // เติมบรรทัดแจ้งจบคอร์สใน "ข้อความตอบกลับเดียวกัน"
             completionLines.push(
               `🎉 คอร์สยา "${rx.drugName}" ครบแล้ว ระบบหยุดแจ้งเตือนให้แล้วค่ะ/ครับ`,
             );
