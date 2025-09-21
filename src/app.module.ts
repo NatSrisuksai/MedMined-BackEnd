@@ -11,6 +11,8 @@ import { CronController } from './cron/cron.controller';
 import { LineModule } from './line/line.module';
 import { PrescriptionModule } from './prescriptions/prescriptions.module';
 import { PrismaModule } from './prisma/prisma.module';
+import { ServeStaticModule } from '@nestjs/serve-static';
+import { join } from 'path';
 
 @Module({
   imports: [
@@ -19,6 +21,11 @@ import { PrismaModule } from './prisma/prisma.module';
     LineModule,
     PrescriptionModule,
     PrismaModule,
+    ServeStaticModule.forRoot({
+      rootPath: join(process.cwd(), 'assets'),
+      serveRoot: '/assets',
+      exclude: ['/api*', '/webhook*'],
+    }),
   ],
   controllers: [
     AppController,

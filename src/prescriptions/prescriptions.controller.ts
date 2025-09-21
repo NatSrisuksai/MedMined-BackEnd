@@ -460,8 +460,6 @@ function buildRxSummary(
       ? `จำนวนเม็ดยาทั้งหมด: ${rx.quantityTotal}`
       : null,
     `วิธีรับประทาน: ${methodTh}`,
-    `ช่วงคอร์ส: ${formatYMD(rx.startDate)}${rx.endDate ? ` ถึง ${formatYMD(rx.endDate)}` : ''}`,
-    `เขตเวลา: ${rx.timezone}`,
     'ตารางมื้อ:',
     scheduleLines || '• -',
     rx.notes ? `หมายเหตุ: ${rx.notes}` : null,
