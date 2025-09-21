@@ -6,7 +6,8 @@ let startedAt = 0;
 const MAX_RUN_MS = 55_000;
 
 const REMIND_EVERY_MIN = 30; // เตือนซ้ำทุก 30 นาที
-const DYNAMIC = process.env.CRON_DYNAMIC_WINDOW === '1';
+// const DYNAMIC = process.env.CRON_DYNAMIC_WINDOW === '1';
+const DYNAMIC = true;
 const VERBOSE = (process.env.CRON_VERBOSE || '1') !== '0';
 
 const PERIOD_WINDOWS: Record<string, { start: number; end: number }> = {
