@@ -2,27 +2,13 @@ import { Controller, Post, Req, Res, Logger } from '@nestjs/common';
 import * as crypto from 'crypto';
 import { PrismaService } from 'src/prisma/prisma.service';
 
-const PERIOD_WINDOWS: Record<string, { start: number; end: number }> = {
-  MORNING: { start: hm('08:00'), end: hm('12:00') },
-  NOON: { start: hm('12:00'), end: hm('18:00') },
-  EVENING: { start: hm('18:00'), end: hm('22:00') },
-  BEDTIME: { start: hm('22:00'), end: hm('24:00') },
-  CUSTOM: { start: 0, end: 0 },
-};
-function hm(hhmm: string) {
-  const [h, m] = hhmm.split(':').map(Number);
-  return (h || 0) * 60 + (m || 0);
-}
-
 @Controller('webhook/line')
 export class LineWebhookController {
   private readonly logger = new Logger(LineWebhookController.name);
-
   constructor(private readonly prisma: PrismaService) {}
 
   @Post()
   async handle(@Req() req: any, @Res() res: any) {
-    // verify signature
     const signature = req.headers['x-line-signature'] as string;
     const raw: Buffer = req.rawBody;
     if (!raw) return res.status(400).send('Raw body missing');
@@ -42,6 +28,8 @@ export class LineWebhookController {
       try {
         if (ev.type === 'message' && ev.message?.type === 'text') {
           await this.onText(ev);
+        } else if (ev.type === 'postback' && ev.postback?.data) {
+          await this.replyTo(ev.replyToken, 'กำลังพัฒนาเมนู 😉');
         }
       } catch (err) {
         this.logger.error('Webhook event error', err as any);
@@ -56,6 +44,9 @@ export class LineWebhookController {
     if (!lineUserId) return;
     const text: string = String(ev.message?.text || '').trim();
 
+    // =========================
+    // 1) เมนู "ข้อมูลผู้ใช้"
+    // =========================
     if (text === 'ข้อมูลผู้ใช้') {
       const patient = await this.prisma.patient.findFirst({
         where: { lineUserId },
@@ -89,7 +80,6 @@ export class LineWebhookController {
         orderBy: { prescriptionId: 'asc' },
       });
 
-      // สรุปรายการยา
       const lines: string[] = [];
       let idx = 1;
 
@@ -136,7 +126,9 @@ export class LineWebhookController {
       return;
     }
 
-    // ✅ เดิม: "รับประทานยาแล้ว" → บันทึกเฉพาะช่วงปัจจุบัน + ถ้าครบคอร์สให้แจ้งทันที
+    // =========================
+    // 2) เมนู "รับประทานยาแล้ว"
+    // =========================
     if (text === 'รับประทานยาแล้ว') {
       const patient = await this.prisma.patient.findFirst({
         where: { lineUserId },
@@ -158,10 +150,16 @@ export class LineWebhookController {
               id: true,
               drugName: true,
               timezone: true,
-              quantityTotal: true, // ใช้เช็กครบคอร์ส
+              quantityTotal: true,
               schedules: {
                 where: { isActive: true },
-                select: { period: true, hhmm: true, pills: true },
+                select: {
+                  period: true,
+                  hhmm: true,
+                  pills: true,
+                  isActive: true,
+                }, // <-- add isActive
+                orderBy: { hhmm: 'asc' },
               },
             },
           },
@@ -169,7 +167,7 @@ export class LineWebhookController {
       });
 
       const takenList: string[] = [];
-      const completionLines: string[] = [];
+      const finishedNow: string[] = [];
 
       for (const inv of invs) {
         const rx = inv.prescription;
@@ -179,16 +177,28 @@ export class LineWebhookController {
         const ymd = formatYMDInTz(new Date(), tz);
         const nowMin = hhmmToMinutes(formatHHMMInTz(new Date(), tz));
 
-        // หาช่วง "ปัจจุบัน" ตาม fixed windows
-        const current = rx.schedules.find((s) => {
-          const win = PERIOD_WINDOWS[s.period];
-          return win && nowMin >= win.start && nowMin < win.end;
-        });
-        if (!current) continue;
+        const sorted = rx.schedules
+          .filter((s) => s.isActive)
+          .slice()
+          .sort((a, b) => a.hhmm.localeCompare(b.hhmm));
+        let current: (typeof sorted)[number] | null = null;
+
+        for (let i = 0; i < sorted.length; i++) {
+          const s = sorted[i];
+          const nextStart = i + 1 < sorted.length ? sorted[i + 1].hhmm : null;
+          const { winStart, winEnd } = computeWindowForSlot(
+            s.hhmm,
+            s.period,
+            nextStart,
+          );
+          if (nowMin >= winStart && nowMin < winEnd) {
+            current = s;
+            break;
+          }
+        }
+        if (!current) continue; // อยู่นอกหน้าต่างของมื้อใด ๆ
 
         const slotDate = ymdToMidnightUTC(ymd);
-
-        // กันบันทึกซ้ำ
         const exists = await this.prisma.doseIntake.findUnique({
           where: {
             patientId_prescriptionId_slotDate_hhmm: {
@@ -202,7 +212,6 @@ export class LineWebhookController {
         });
         if (exists) continue;
 
-        // บันทึกการทานช่วงนี้
         await this.prisma.doseIntake.create({
           data: {
             patientId: patient.id,
@@ -217,7 +226,7 @@ export class LineWebhookController {
           `${rx.drugName} — ${periodToThai(current.period)} ${current.hhmm} (${current.pills} เม็ด)`,
         );
 
-        // เช็กครบคอร์สทันที
+        // เช็คครบคอร์สทันที
         if (typeof rx.quantityTotal === 'number') {
           const sumTaken = await this.prisma.doseIntake.aggregate({
             where: { prescriptionId: rx.id },
@@ -235,12 +244,8 @@ export class LineWebhookController {
                 },
                 data: { isActive: false },
               });
-            } catch (e: any) {
-              this.logger.warn(
-                `inventory deactivate failed p=${patient.id} rx=${rx.id}: ${e?.message || e}`,
-              );
-            }
-            completionLines.push(
+            } catch {}
+            finishedNow.push(
               `🎉 คอร์สยา "${rx.drugName}" ครบแล้ว ระบบหยุดแจ้งเตือนให้แล้วค่ะ/ครับ`,
             );
           }
@@ -250,35 +255,79 @@ export class LineWebhookController {
       if (takenList.length === 0) {
         await this.replyTo(
           ev.replyToken,
-          'ยังไม่พบช่วงเวลาปัจจุบัน หรือบันทึกไปแล้ว',
+          'ยังไม่พบมื้อที่ถึงเวลาในตอนนี้ หรือบันทึกไปแล้ว',
         );
       } else {
-        const msg =
-          `บันทึกการรับประทานแล้ว:\n` +
-          takenList.map((t, i) => `${i + 1}. ${t}`).join('\n') +
-          (completionLines.length ? `\n\n${completionLines.join('\n')}` : '');
-        await this.replyTo(ev.replyToken, msg);
+        const text = `บันทึกการรับประทานแล้ว:
+${takenList.map((t, i) => `${i + 1}. ${t}`).join('\n')}
+${finishedNow.length ? '\n' + finishedNow.join('\n') : ''}`;
+        await this.replyTo(ev.replyToken, text);
       }
       return;
     }
   }
 
-  private async replyTo(replyToken: string, text: string) {
+  private async replyTo(replyToken: string, text: string | any) {
+    const token = process.env.LINE_CHANNEL_ACCESS_TOKEN!;
+    const messages =
+      typeof text === 'string' ? [{ type: 'text', text }] : [text];
     await fetch('https://api.line.me/v2/bot/message/reply', {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}`,
+        Authorization: `Bearer ${token}`,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({
-        replyToken,
-        messages: [{ type: 'text', text }],
-      }),
+      body: JSON.stringify({ replyToken, messages }),
     });
   }
 }
 
-/* ===== Helpers (เวลา/โซน/ข้อความ) ===== */
+/* ===== Helpers (ให้สอดคล้องกับ cron) ===== */
+
+function computeWindowForSlot(
+  currentHHMM: string,
+  currentPeriod: string,
+  nextStartHHMM: string | null,
+) {
+  const start = hhmmToMinutes(currentHHMM);
+  const hardStop = nextStartHHMM ? hhmmToMinutes(nextStartHHMM) : 24 * 60;
+
+  // ก่อนอาหาร → 1 ชั่วโมงหลังเวลา slot
+  if (
+    currentPeriod === 'BEFORE_BREAKFAST' ||
+    currentPeriod === 'BEFORE_LUNCH' ||
+    currentPeriod === 'BEFORE_DINNER'
+  ) {
+    const end1h = start + 60;
+    return { winStart: start, winEnd: Math.min(end1h, hardStop) };
+  }
+
+  // ก่อนนอน → ถึงเที่ยงคืน
+  if (currentPeriod === 'BEFORE_BED') {
+    return { winStart: start, winEnd: 24 * 60 };
+  }
+
+  // หลังอาหาร/อื่น ๆ → ถึง slot ถัดไป
+  return { winStart: start, winEnd: hardStop };
+}
+
+function periodToThai(p: string) {
+  return p === 'BEFORE_BREAKFAST'
+    ? 'ก่อนอาหารเช้า'
+    : p === 'AFTER_BREAKFAST'
+      ? 'หลังอาหารเช้า'
+      : p === 'BEFORE_LUNCH'
+        ? 'ก่อนอาหารเที่ยง'
+        : p === 'AFTER_LUNCH'
+          ? 'หลังอาหารเที่ยง'
+          : p === 'BEFORE_DINNER'
+            ? 'ก่อนอาหารเย็น'
+            : p === 'AFTER_DINNER'
+              ? 'หลังอาหารเย็น'
+              : p === 'BEFORE_BED'
+                ? 'ก่อนนอน'
+                : 'อื่นๆ';
+}
 function formatYMDInTz(date: Date, timeZone: string) {
   const fmt = new Intl.DateTimeFormat('en-CA', {
     timeZone,
@@ -303,15 +352,4 @@ function hhmmToMinutes(hhmm: string) {
 }
 function ymdToMidnightUTC(ymd: string) {
   return new Date(`${ymd}T00:00:00.000Z`);
-}
-function periodToThai(p: string) {
-  return p === 'MORNING'
-    ? 'เช้า'
-    : p === 'NOON'
-      ? 'กลางวัน'
-      : p === 'EVENING'
-        ? 'เย็น'
-        : p === 'BEDTIME'
-          ? 'ก่อนนอน'
-          : 'อื่นๆ';
 }

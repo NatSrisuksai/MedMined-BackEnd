@@ -17,10 +17,14 @@ generator client {
 }
 
 enum MealRelation {
-  BEFORE_MEAL
-  AFTER_MEAL
-  WITH_MEAL
-  NONE
+  BEFORE_BREAKFAST   // 07:00
+  AFTER_BREAKFAST    // 08:00
+  BEFORE_LUNCH       // 11:00
+  AFTER_LUNCH        // 12:00
+  BEFORE_DINNER      // 15:00
+  AFTER_DINNER       // 16:00
+  BEFORE_BED         // 20:00
+  CUSTOM
 }
 
 enum DosePeriod {
@@ -93,7 +97,7 @@ model DoseSchedule {
   prescriptionId String
   prescription   Prescription @relation(fields: [prescriptionId], references: [id], onDelete: Cascade)
 
-  period    DosePeriod // MORNING/NOON/EVENING/BEDTIME/CUSTOM
+  period         MealRelation
   hhmm      String // "08:00" (หรือค่าจากแบบฟอร์ม เช่น เช้า=08:00, กลางวัน=12:00, เย็น=18:00, ก่อนนอน=22:00)
   pills     Int // จำนวนเม็ดใน “มื้อ/ช่วง” นี้
   isActive  Boolean    @default(true)
