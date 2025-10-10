@@ -1,0 +1,2 @@
+-- AlterTable
+ALTER TABLE "public"."DoseIntake" ALTER COLUMN "pills" SET DATA TYPE DOUBLE PRECISION;

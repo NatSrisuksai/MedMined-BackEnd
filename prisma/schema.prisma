@@ -108,6 +108,7 @@ model MedicationInventory {
   prescriptionId String
   isActive       Boolean  @default(true)
   createdAt      DateTime @default(now())
+  updatedAt      DateTime @default(now())
 
   patient Patient @relation(fields: [patientId], references: [id])
 
@@ -136,7 +137,7 @@ model DoseIntake {
   hhmm           String
   slotDate       DateTime // วันที่ของมื้อนั้น (00:00)
   takenAt        DateTime @default(now())
-  pills          Int // จำนวนเม็ดที่ทานจริงในมื้อ/ครั้งนี้ (ปกติ = schedules.pills)
+  pills          Float // จำนวนเม็ดที่ทานจริงในมื้อ/ครั้งนี้ (ปกติ = schedules.pills)
 
   patient Patient @relation(fields: [patientId], references: [id], onDelete: Cascade)
 

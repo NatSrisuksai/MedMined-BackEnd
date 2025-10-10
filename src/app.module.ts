@@ -13,6 +13,7 @@ import { PrescriptionModule } from './prescriptions/prescriptions.module';
 import { PrismaModule } from './prisma/prisma.module';
 import { ServeStaticModule } from '@nestjs/serve-static';
 import { join } from 'path';
+import { AdminInventoryController } from './admin/admin-inventory.controller';
 
 @Module({
   imports: [
@@ -32,6 +33,7 @@ import { join } from 'path';
     LineWebhookController,
     PrescriptionsController,
     CronController,
+    AdminInventoryController,
   ],
   providers: [AppService, PrismaService, LineService],
 })
