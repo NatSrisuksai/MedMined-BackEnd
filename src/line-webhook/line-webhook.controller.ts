@@ -90,7 +90,8 @@ export class LineWebhookController {
         const schedulesText = rx.schedules.length
           ? rx.schedules
               .map(
-                (s) => `${periodToThai(s.period)} ${s.hhmm} (${s.pills} เม็ด)`,
+                (s) =>
+                  `${periodToThai(s.period)} ${s.hhmm} (${String(s.pills)} เม็ด)`,
               )
               .join(', ')
           : '-';
@@ -223,7 +224,9 @@ export class LineWebhookController {
         });
 
         takenList.push(
-          `${rx.drugName} — ${periodToThai(current.period)} ${current.hhmm} (${current.pills} เม็ด)`,
+          `${rx.drugName} — ${periodToThai(current.period)} ${current.hhmm} (${String(
+            current.pills,
+          )} เม็ด)`,
         );
 
         // เช็คครบคอร์สทันที

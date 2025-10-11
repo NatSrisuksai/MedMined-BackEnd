@@ -95,7 +95,13 @@ export class PrescriptionsController {
     if (dto.hn?.trim()) {
       const existingPatient = await this.prisma.patient.findFirst({
         where: { hn: dto.hn.trim() },
-        select: { id: true, fullName: true, firstName: true, lastName: true, hn: true },
+        select: {
+          id: true,
+          fullName: true,
+          firstName: true,
+          lastName: true,
+          hn: true,
+        },
       });
 
       if (existingPatient) {
@@ -105,8 +111,8 @@ export class PrescriptionsController {
         if (inputFullName !== existingFullName) {
           throw new BadRequestException(
             `❌ ชื่อไม่ตรงกับ HN นี้!\n` +
-            `HN "${dto.hn}" เป็นของผู้ป่วยชื่อ: "${existingPatient.fullName}"\n` +
-            `กรุณาตรวจสอบชื่อหรือ HN ให้ถูกต้อง`
+              `HN "${dto.hn}" เป็นของผู้ป่วยชื่อ: "${existingPatient.fullName}"\n` +
+              `กรุณาตรวจสอบชื่อหรือ HN ให้ถูกต้อง`,
           );
         }
 
@@ -140,7 +146,7 @@ export class PrescriptionsController {
           data: {
             patientId: existingPatient.id,
             prescriptionId: created.id,
-            isActive: true, 
+            isActive: true,
           },
         });
         return {
@@ -191,9 +197,9 @@ export class PrescriptionsController {
     });
     await this.prisma.medicationInventory.create({
       data: {
-        patientId:  patient.id,
+        patientId: patient.id,
         prescriptionId: created.id,
-        isActive: true,  
+        isActive: true,
       },
     });
     return {
@@ -390,7 +396,7 @@ function buildPrescriptionSummary(input: {
     .sort((a, b) => a.hhmm.localeCompare(b.hhmm))
     .map(
       (s, i) =>
-        `${i + 1}. ${periodToThai(s.period)} ${s.hhmm} — ${s.pills} เม็ด`,
+        `${i + 1}. ${periodToThai(s.period)} ${s.hhmm} — ${String(s.pills)} เม็ด`,
     )
     .join('\n');
   const note = input.notes ? `\nหมายเหตุ: ${input.notes}` : '';

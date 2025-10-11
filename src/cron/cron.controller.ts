@@ -199,7 +199,7 @@ export class CronController {
               cadence * 60_000;
           if (!shouldRemind) break;
 
-          const label = `${periodToThai(s.period)} ${s.hhmm} — ${rx.drugName} ${s.pills} เม็ด`;
+          const label = `${periodToThai(s.period)} ${s.hhmm} — ${rx.drugName} ${String(s.pills)} เม็ด`;
           dueSlots.push({
             rxId: rx.id,
             rxName: rx.drugName,
