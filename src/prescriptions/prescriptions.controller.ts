@@ -13,8 +13,6 @@ import { PrismaService } from 'src/prisma/prisma.service';
 import * as crypto from 'crypto';
 
 type CreateScheduleDto = {
-  // 'BEFORE_BREAKFAST' | 'AFTER_BREAKFAST' | 'BEFORE_LUNCH' | 'AFTER_LUNCH'
-  // | 'BEFORE_DINNER' | 'AFTER_DINNER' | 'BEFORE_BED' | 'CUSTOM'
   period:
     | 'BEFORE_BREAKFAST'
     | 'AFTER_BREAKFAST'
@@ -24,25 +22,23 @@ type CreateScheduleDto = {
     | 'AFTER_DINNER'
     | 'BEFORE_BED'
     | 'CUSTOM';
-  hhmm?: string; // ไม่ส่งมาก็จะ auto-fill จาก period
-  pills: number; // จำนวนเม็ดต่อครั้ง
+  hhmm?: string;
+  pills: number;
   isActive?: boolean;
 };
 
 type CreatePrescriptionDto = {
-  // Patient
   firstName?: string | null;
   lastName?: string | null;
-  fullName: string; // ใช้แสดงผลหลัก
+  fullName: string;
   age?: number | null;
   hn?: string | null;
 
-  // Prescription
   drugName: string;
-  issueDate?: string | null; // ISO
-  startDate?: string | null; // ISO
-  endDate?: string | null; // ISO
-  timezone?: string; // default 'Asia/Bangkok'
+  issueDate?: string | null;
+  startDate?: string | null;
+  endDate?: string | null;
+  timezone?: string;
   quantityTotal?: number | null;
   notes?: string | null;
 
@@ -54,7 +50,32 @@ export class PrescriptionsController {
   private readonly logger = new Logger(PrescriptionsController.name);
   constructor(private readonly prisma: PrismaService) {}
 
-  /** สร้างใบยา + สร้าง/หา Patient + เติมเวลาจาก period อัตโนมัติ */
+  /**
+   * GET /api/patient/suggest?hn=xxx
+   * แนะนำชื่อผู้ป่วยจาก HN
+   */
+  @Get('patient/suggest')
+  async suggestPatient(@Query('hn') hn?: string) {
+    if (!hn?.trim()) {
+      return { patient: null };
+    }
+
+    const patient = await this.prisma.patient.findFirst({
+      where: { hn: hn.trim() },
+      select: {
+        id: true,
+        firstName: true,
+        lastName: true,
+        fullName: true,
+        hn: true,
+        age: true,
+      },
+    });
+
+    return { patient };
+  }
+
+  /** สร้างใบยา + ตรวจสอบ HN Lock */
   @Post('prescriptions')
   async create(@Body() dto: CreatePrescriptionDto) {
     if (!dto?.fullName?.trim()) {
@@ -66,33 +87,84 @@ export class PrescriptionsController {
     if (!Array.isArray(dto.schedules) || dto.schedules.length === 0) {
       throw new BadRequestException('schedules is required (non-empty)');
     }
+    if (!dto?.hn?.trim()) {
+      throw new BadRequestException('HN is required');
+    }
 
-    // หา/สร้าง Patient (อิง HN ก่อน ถ้ามี; ไม่งั้นใช้ fullName)
-    let patient = await this.prisma.patient.findFirst({
-      where: {
-        OR: [
-          dto.hn ? { hn: dto.hn } : undefined,
-          { fullName: dto.fullName },
-        ].filter(Boolean) as any,
+    // ตรวจสอบ HN Lock
+    if (dto.hn?.trim()) {
+      const existingPatient = await this.prisma.patient.findFirst({
+        where: { hn: dto.hn.trim() },
+        select: { id: true, fullName: true, firstName: true, lastName: true, hn: true },
+      });
+
+      if (existingPatient) {
+        const inputFullName = dto.fullName.trim().toLowerCase();
+        const existingFullName = existingPatient.fullName.trim().toLowerCase();
+
+        if (inputFullName !== existingFullName) {
+          throw new BadRequestException(
+            `❌ ชื่อไม่ตรงกับ HN นี้!\n` +
+            `HN "${dto.hn}" เป็นของผู้ป่วยชื่อ: "${existingPatient.fullName}"\n` +
+            `กรุณาตรวจสอบชื่อหรือ HN ให้ถูกต้อง`
+          );
+        }
+
+        // HN ตรง + ชื่อตรง → ใช้ patient เดิม
+        const opaqueId = genOpaqueId();
+        const data: any = {
+          patientId: existingPatient.id,
+          opaqueId,
+          drugName: dto.drugName,
+          issueDate: dto.issueDate ? new Date(dto.issueDate) : null,
+          timezone: dto.timezone || 'Asia/Bangkok',
+          quantityTotal: dto.quantityTotal ?? null,
+          notes: dto.notes ?? null,
+          schedules: {
+            create: dto.schedules.map((s) => ({
+              period: s.period,
+              hhmm: s.hhmm || canonicalHHMM(s.period),
+              pills: Number(s.pills || 1),
+              isActive: s.isActive !== false,
+            })),
+          },
+        };
+        if (dto.startDate) data.startDate = new Date(dto.startDate);
+        if (dto.endDate) data.endDate = new Date(dto.endDate);
+
+        const created = await this.prisma.prescription.create({
+          data,
+          select: { id: true, opaqueId: true, patientId: true },
+        });
+        await this.prisma.medicationInventory.create({
+          data: {
+            patientId: existingPatient.id,
+            prescriptionId: created.id,
+            isActive: true, 
+          },
+        });
+        return {
+          ok: true,
+          prescriptionId: created.id,
+          opaqueId: created.opaqueId,
+          patientId: created.patientId,
+        };
+      }
+    }
+
+    // HN ยังไม่มีในระบบ → สร้างผู้ป่วยใหม่
+    const patient = await this.prisma.patient.create({
+      data: {
+        firstName: dto.firstName ?? null,
+        lastName: dto.lastName ?? null,
+        fullName: dto.fullName,
+        age: dto.age ?? null,
+        hn: dto.hn.trim(), // HN เป็น required แล้ว
       },
       select: { id: true },
     });
 
-    if (!patient) {
-      patient = await this.prisma.patient.create({
-        data: {
-          firstName: dto.firstName ?? null,
-          lastName: dto.lastName ?? null,
-          fullName: dto.fullName,
-          age: dto.age ?? null,
-          hn: dto.hn ?? null,
-        },
-        select: { id: true },
-      });
-    }
-
     const opaqueId = genOpaqueId();
-
     const data: any = {
       patientId: patient.id,
       opaqueId,
@@ -117,7 +189,13 @@ export class PrescriptionsController {
       data,
       select: { id: true, opaqueId: true, patientId: true },
     });
-
+    await this.prisma.medicationInventory.create({
+      data: {
+        patientId:  patient.id,
+        prescriptionId: created.id,
+        isActive: true,  
+      },
+    });
     return {
       ok: true,
       prescriptionId: created.id,
@@ -150,6 +228,9 @@ export class PrescriptionsController {
           select: { period: true, hhmm: true, pills: true },
           orderBy: { hhmm: 'asc' },
         },
+        MedicationInventory: {
+          select: { isActive: true },
+        },
       },
       orderBy: { createdAt: 'desc' },
     });
@@ -161,10 +242,6 @@ export class PrescriptionsController {
    * Activate จาก QR/LIFF:
    * POST /api/p/:opaqueId/activate
    * body: { lineUserId: string }
-   * - ผูก patient.lineUserId (ถ้ายังว่าง)
-   * - บันทึก recentActivatedPrescriptionId
-   * - upsert MedicationInventory.isActive = true
-   * - push สรุปยาไปหา user
    */
   @Post('p/:opaqueId/activate')
   async activate(
@@ -254,10 +331,9 @@ export class PrescriptionsController {
 /* ================= Helpers ================= */
 
 function genOpaqueId() {
-  return crypto.randomBytes(4).toString('hex'); // เช่น "7ae376ba"
+  return crypto.randomBytes(4).toString('hex');
 }
 
-/** default hhmm ต่อ period ใหม่ */
 function canonicalHHMM(period: string): string {
   switch (period) {
     case 'BEFORE_BREAKFAST':
@@ -275,7 +351,7 @@ function canonicalHHMM(period: string): string {
     case 'BEFORE_BED':
       return '20:00';
     default:
-      return ''; // CUSTOM ต้องส่ง hhmm เอง
+      return '';
   }
 }
 
@@ -297,7 +373,6 @@ function periodToThai(p: string) {
                 : 'อื่นๆ';
 }
 
-/** สรุปข้อความใบยา */
 function buildPrescriptionSummary(input: {
   patientName?: string;
   hn?: string;
@@ -323,7 +398,6 @@ function buildPrescriptionSummary(input: {
   return `${header}\n${drug}\n${tz}\n\nช่วงเวลากินยา:\n${lines}${note}${footer}`;
 }
 
-/** LINE push text */
 async function pushText(toLineUserId: string, text: string) {
   const token = process.env.LINE_CHANNEL_ACCESS_TOKEN!;
   const res = await fetch('https://api.line.me/v2/bot/message/push', {

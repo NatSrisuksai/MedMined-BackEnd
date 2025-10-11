@@ -99,7 +99,7 @@ model DoseSchedule {
 
   period         MealRelation
   hhmm      String // "08:00" (หรือค่าจากแบบฟอร์ม เช่น เช้า=08:00, กลางวัน=12:00, เย็น=18:00, ก่อนนอน=22:00)
-  pills     Int // จำนวนเม็ดใน “มื้อ/ช่วง” นี้
+  pills     Float // จำนวนเม็ดใน “มื้อ/ช่วง” นี้
   isActive  Boolean    @default(true)
   createdAt DateTime   @default(now())
 
