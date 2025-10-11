@@ -138,10 +138,12 @@ export class CronController {
               });
             } catch {}
             try {
-              await pushText(
-                p.lineUserId!,
-                `🎉 คอร์สยา "${rx.drugName}" ครบแล้ว ระบบหยุดแจ้งเตือนให้แล้วค่ะ/ครับ`,
-              );
+              await pushMessages(p.lineUserId!, [
+                {
+                  type: 'text',
+                  text: `🎉 คอร์สยา "${rx.drugName}" ครบแล้ว ระบบหยุดแจ้งเตือนให้แล้วค่ะ/ครับ`,
+                },
+              ]);
             } catch {}
             continue;
           }
@@ -219,12 +221,32 @@ export class CronController {
 
       const name =
         p.fullName || [p.firstName, p.lastName].filter(Boolean).join(' ');
-      const msg = `⏰ ถึงเวลาใช้ยาแล้ว
+      const textMsg = `⏰ ถึงเวลาใช้ยาแล้ว
 ${name ? `ผู้ป่วย: ${name}\n` : ''}${dueSlots.map((d, i) => `${i + 1}. ${d.label}`).join('\n')}
 (พิมพ์ "รับประทานยาแล้ว" เพื่อหยุดเตือนช่วงนี้)`;
 
+      const messages: any[] = [];
+
+      // Add image message if applicable
+      const firstPeriod = dueSlots[0].period;
+      const imageName = periodToImage(firstPeriod);
+      // NOTE: Please ensure PUBLIC_BASE_URL is configured in your environment.
+      // It should be the public URL to the directory containing the 'assets' folder.
+      const baseUrl = process.env.PUBLIC_BASE_URL;
+
+      if (imageName && baseUrl) {
+        const imageUrl = `${baseUrl}/assets/${imageName}`;
+        messages.push({
+          type: 'image',
+          originalContentUrl: imageUrl,
+          previewImageUrl: imageUrl,
+        });
+      }
+
+      messages.push({ type: 'text', text: textMsg });
+
       try {
-        await pushText(p.lineUserId!, msg);
+        await pushMessages(p.lineUserId!, messages);
       } catch (e: any) {
         this.logger.error(
           `LINE push error to ${p.lineUserId}: ${e?.message || e}`,
@@ -337,8 +359,17 @@ function periodToThai(p: string) {
                 : 'อื่นๆ';
 }
 
-/* ===== LINE push (simple text) ===== */
-async function pushText(to: string, text: string) {
+function periodToImage(period: string): string | null {
+  if (period.includes('BREAKFAST')) return 'morning.jpg';
+  if (period.includes('LUNCH')) return 'noon.jpg';
+  if (period.includes('DINNER')) return 'evening.jpg';
+  if (period.includes('BED')) return 'bedtime.jpg';
+  return null;
+}
+
+/* ===== LINE push (can send multiple messages e.g. image + text) ===== */
+async function pushMessages(to: string, messages: any[]) {
+  if (messages.length === 0) return;
   const token = process.env.LINE_CHANNEL_ACCESS_TOKEN!;
   const res = await fetch('https://api.line.me/v2/bot/message/push', {
     method: 'POST',
@@ -346,7 +377,7 @@ async function pushText(to: string, text: string) {
       Authorization: `Bearer ${token}`,
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({ to, messages: [{ type: 'text', text }] }),
+    body: JSON.stringify({ to, messages }),
   });
   if (!res.ok) {
     const body = await res.text().catch(() => '');
