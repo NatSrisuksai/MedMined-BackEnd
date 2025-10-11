@@ -67,7 +67,7 @@ model Prescription {
   // ✅ ฟิลด์เอกสาร/ยาใหม่
   issueDate     DateTime? // วันที่กรอก/ออกใบจ่ายยา
   drugName      String
-  quantityTotal Int? // จำนวนเม็ดยาทั้งหมดที่ได้รับ/ต้องทานจนหมด
+  quantityTotal Float? // จำนวนเม็ดยาทั้งหมดที่ได้รับ/ต้องทานจนหมด
   method        MealRelation? // BEFORE/AFTER/WITH/NONE
   notes         String?
 
